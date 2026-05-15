@@ -110,40 +110,43 @@ class TradeService {
                 const { getMcxBaseScrip } = require('../utils/symbolHelper');
                 const base = getMcxBaseScrip(trade.symbol);
                 const marketDataService = require('./MarketDataService');
+                const isIndianSegment = ['MCX', 'NSE', 'NFO', 'EQUITY', 'OPTIONS'].includes(mType);
 
-                // 🎯 1. Try Memory Ticker (Multiple Prefixes)
-                const searchPatterns = [trade.symbol, `MCX:${trade.symbol}`, `NFO:${trade.symbol}`, `NSE:${trade.symbol}`];
-                let liveData = null;
-                for (const p of searchPatterns) {
-                    liveData = marketDataService.getPrice(p);
-                    if (liveData) break;
-                }
-
-                if (liveData) {
-                    finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
-                    console.log(`[TradeService] Found in Ticker (LTP Priority): ${finalExitPrice}`);
-                }
-
-                // 🎯 2. Fallback to Kite API (Full Quote)
-                if ((!finalExitPrice || finalExitPrice <= 0) && kiteService.isAuthenticated()) {
+                // 🎯 1. For Indian Segments, try Kite API (Direct Quote) FIRST for accuracy
+                if (isIndianSegment && kiteService.isAuthenticated()) {
                     try {
                         const kiteSym = trade.symbol.includes(':') ? trade.symbol : (mType === 'MCX' ? `MCX:${trade.symbol}` : (mType === 'EQUITY' ? `NSE:${trade.symbol}` : `NFO:${trade.symbol}`));
-                        console.log(`[TradeService] Fetching Live Quote from Kite: ${kiteSym}`);
+                        console.log(`[TradeService] Fetching Real-time Kite Quote for ${kiteSym}...`);
                         const quoteRes = await kiteService.getQuote(kiteSym);
                         const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
-                        if (quote) {
-                            finalExitPrice = quote.last_price || (trade.type === 'BUY' ? quote.depth?.buy?.[0]?.price : quote.depth?.sell?.[0]?.price);
-                            console.log(`[TradeService] Kite Quote Received (LTP Priority): ${finalExitPrice}`);
+                        if (quote && quote.last_price > 0) {
+                            finalExitPrice = quote.last_price;
+                            console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice}`);
                         }
                     } catch (e) {
-                        console.error(`[TradeService] Kite Quote Error:`, e.message);
+                        console.warn(`[TradeService] Kite Quote Fallback triggered:`, e.message);
+                    }
+                }
+
+                // 🎯 2. Try Memory Ticker (Primary for Forex/Crypto, Fallback for others)
+                if (!finalExitPrice || finalExitPrice <= 0) {
+                    const searchPatterns = [trade.symbol, `MCX:${trade.symbol}`, `NFO:${trade.symbol}`, `NSE:${trade.symbol}`, `FOREX:${trade.symbol}`, `CRYPTO:${trade.symbol}`];
+                    let liveData = null;
+                    for (const p of searchPatterns) {
+                        liveData = marketDataService.getPrice(p);
+                        if (liveData) break;
+                    }
+
+                    if (liveData) {
+                        finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
+                        console.log(`[TradeService] Found in Ticker: ${finalExitPrice}`);
                     }
                 }
 
                 // 🎯 3. Final Fallback (Entry Price)
                 if (!finalExitPrice || finalExitPrice <= 0) {
                     finalExitPrice = trade.entry_price;
-                    console.log(`[TradeService] Using Entry Price as Fallback: ${finalExitPrice}`);
+                    console.warn(`[TradeService] ⚠️ No live price found, using Entry Price: ${finalExitPrice}`);
                 }
             }
 
