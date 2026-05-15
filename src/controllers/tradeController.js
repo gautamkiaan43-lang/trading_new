@@ -1,0 +1,2056 @@
+const db = require('../config/db');
+const { logAction } = require('./systemController');
+const mockEngine = require('../utils/mockEngine');
+const bcrypt = require('bcryptjs');
+const { invalidateCache } = require('../utils/cacheManager');
+const { getMcxBaseScrip } = require('../utils/symbolHelper');
+const MarginService = require('../services/MarginService');
+
+
+/**
+ * Place a New Order
+ */
+const placeOrder = async (req, res) => {
+    // Safety check: ensure req.body exists
+    console.log('[placeOrder] Request received:');
+    console.log('  Method:', req.method);
+    console.log('  URL:', req.url);
+    console.log('  Content-Type:', req.headers['content-type']);
+    console.log('  Body type:', typeof req.body);
+    console.log('  Body is Array:', Array.isArray(req.body));
+    console.log('  Body keys:', req.body ? Object.keys(req.body) : 'N/A');
+    console.log('  Body:', JSON.stringify(req.body, null, 2));
+
+    if (!req.body || Object.keys(req.body).length === 0) {
+        console.error('[placeOrder] ERROR: req.body is empty or undefined!');
+        console.error('[placeOrder] Request headers:', req.headers);
+        return res.status(400).json({ message: 'Request body is empty. Please check your request format.' });
+    }
+
+    const {
+        symbol, type, qty, price,
+        order_type = 'MARKET',
+        is_pending = false,
+        userId: traderId,
+        transactionPassword,
+        exit_price,
+        mcxExposureType = 'PER_LOT_BASIS',  // ✅ ADD THIS - from request body
+        tradeType = 'INTRADAY'              // ✅ ADD THIS - from request body (INTRADAY or HOLDING)
+    } = req.body;
+
+    const requesterId = req.user.id;
+    const requesterRole = req.user.role;
+    const tradeIp = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+
+    try {
+        console.log('--- Place Order Request ---');
+        console.log('Body:', JSON.stringify(req.body, null, 2));
+        console.log('Incoming types:', { symbol: typeof symbol, type: typeof type, qtyType: typeof qty, qtyValue: qty });
+
+        // 1. Basic Field Validation
+        // Accept numeric strings for qty; treat undefined, null, or empty-string as missing
+        const missing = [];
+        if (!symbol) missing.push('symbol');
+        if (!type) missing.push('type');
+        if (qty === undefined || qty === null || qty === '') missing.push('qty');
+        if (missing.length > 0) {
+            return res.status(400).json({ message: 'Missing required fields: ' + missing.join(', ') });
+        }
+
+        // 2. Determine target user (Trader)
+        let targetUserId = requesterId;
+        if (requesterRole !== 'TRADER' && traderId) {
+            targetUserId = traderId;
+        }
+
+        // 3. Validate User Exists and Get Balance/Password
+        const [userRows] = await db.execute(
+            'SELECT id, balance, transaction_password, role FROM users WHERE id = ?',
+            [targetUserId]
+        );
+        const targetUser = userRows[0];
+        if (!targetUser) {
+            return res.status(404).json({ message: 'Target user not found' });
+        }
+
+        // 4. Validate Transaction Password (Bypass for TRADER/Client)
+        if (requesterRole !== 'TRADER') {
+            const [requesterRows] = await db.execute(
+                'SELECT transaction_password FROM users WHERE id = ?',
+                [requesterId]
+            );
+            const requester = requesterRows[0];
+
+            if (!requester || !requester.transaction_password) {
+                return res.status(400).json({ message: 'Your transaction password is not set' });
+            }
+
+            if (!transactionPassword) {
+                return res.status(400).json({ message: 'Transaction password is required' });
+            }
+
+            const isMatch = await bcrypt.compare(transactionPassword, requester.transaction_password);
+            if (!isMatch) {
+                return res.status(403).json({ message: 'Invalid transaction password' });
+            }
+        }
+
+        // ─── FETCH CLIENT CONFIG FOR VALIDATIONS ───────────────────────────────
+        let clientConfig = {};
+        try {
+            const [clientSettings] = await db.execute(
+                'SELECT config_json FROM client_settings WHERE user_id = ?',
+                [targetUserId]
+            );
+            if (clientSettings.length > 0) {
+                clientConfig = JSON.parse(clientSettings[0].config_json || '{}');
+                console.log('[placeOrder] DEBUG - Full clientConfig:', JSON.stringify(clientConfig, null, 2));
+                console.log('[placeOrder] DEBUG - mcxLotMargins exists?', !!clientConfig.mcxLotMargins);
+                if (clientConfig.mcxLotMargins) {
+                    console.log('[placeOrder] DEBUG - mcxLotMargins keys:', Object.keys(clientConfig.mcxLotMargins));
+                }
+            } else {
+                console.log('[placeOrder] DEBUG - No client config found for userId:', targetUserId);
+            }
+        } catch (e) {
+            console.error('[placeOrder] Error fetching client config:', e);
+        }
+
+        // ─── DETECT MARKET TYPE EARLY (needed for all segment-specific validations) ───
+        const sym = symbol.toUpperCase();
+        const MCX_SYMBOLS = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'COPPER', 'NICKEL', 'ZINC', 'LEAD', 'ALUMINIUM', 'ALUMINI', 'NATURALGAS', 'MENTHAOIL', 'COTTON', 'BULLDEX', 'CRUDEOIL MINI', 'ZINCMINI', 'LEADMINI', 'SILVER MIC', 'MGOLD', 'MCRUDEOIL', 'MSILVER', 'MNATURALGAS', 'MCOPPER', 'MLEAD', 'MZINC', 'MALUMINIUM'];
+        let marketType = 'MCX';
+        if (MCX_SYMBOLS.some(s => sym.includes(s))) {
+            marketType = 'MCX';
+        } else if (sym.startsWith('CRYPTO') || ['BTC', 'ETH', 'SOL', 'USDT'].some(c => sym.includes(c))) {
+            marketType = 'CRYPTO';
+        } else if (sym.startsWith('FOREX') || sym.includes('/') || ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'].some(f => sym.includes(f))) {
+            marketType = 'FOREX';
+        } else if (sym.startsWith('COMEX') || ['GC', 'SI', 'HG', 'CL'].some(c => sym.startsWith(c))) {
+            marketType = 'COMEX';
+        } else {
+            marketType = 'EQUITY';
+        }
+
+        console.log('[placeOrder] DEBUG - Symbol detection: sym=' + sym + ', marketType=' + marketType);
+
+        // Also check if scrip_data has market_type defined
+        try {
+            const [scripRows] = await db.execute('SELECT market_type FROM scrip_data WHERE symbol = ?', [sym]);
+            if (scripRows.length > 0 && scripRows[0].market_type) {
+                console.log('[placeOrder] DEBUG - Database market_type override:', scripRows[0].market_type);
+                marketType = scripRows[0].market_type;
+            }
+        } catch (_) { /* scrip_data may not have market_type column yet */ }
+
+        // ─── PARSE QUANTITY AND PRICE EARLY (needed for validations) ──────────────
+        const qtyNum = parseInt(qty, 10);
+
+        // 🚀 Robust Live Price Fetcher (prioritize MarketDataService, then direct Kite API)
+        // 🚀 Robust Live Price Fetcher (prioritize MarketDataService, then direct Kite API)
+        let liveMarketPrice = null;
+        const marketDataService = require('../services/MarketDataService');
+        const kiteService = require('../utils/kiteService');
+
+        // 1. Try to get from MarketDataService with various prefixes
+        const possibleSymbols = [symbol, `MCX:${symbol}`, `NSE:${symbol}`, `NFO:${symbol}`];
+        for (const s of possibleSymbols) {
+            const liveData = marketDataService.getPrice(s);
+            if (liveData && liveData.ltp) {
+                liveMarketPrice = liveData.ltp;
+                console.log(`[placeOrder] 🎯 Price found in MarketDataService for ${s}: ${liveMarketPrice}`);
+                break;
+            }
+        }
+
+        // 2. If not in stream, try DIRECT QUOTE from Kite API (for NFO/NSE/MCX)
+        if (!liveMarketPrice && kiteService.isAuthenticated()) {
+            try {
+                console.log(`[placeOrder] 📡 Price not in stream, fetching direct quote for ${symbol}...`);
+                // Try to find the correct exchange prefix if not provided
+                let kiteSymbol = symbol;
+                if (!symbol.includes(':')) {
+                    if (marketType === 'MCX') kiteSymbol = `MCX:${symbol}`;
+                    else if (marketType === 'EQUITY') kiteSymbol = `NSE:${symbol}`;
+                    else if (marketType === 'OPTIONS' || marketType === 'NFO') kiteSymbol = `NFO:${symbol}`;
+                }
+
+                const quote = await kiteService.getQuote(kiteSymbol);
+                const instrumentKey = Object.keys(quote)[0];
+                if (quote[instrumentKey] && quote[instrumentKey].last_price) {
+                    liveMarketPrice = quote[instrumentKey].last_price;
+                    console.log(`[placeOrder] ✅ Direct Kite Quote for ${kiteSymbol}: ${liveMarketPrice}`);
+
+                    // Also feed this back to MarketDataService for others
+                    marketDataService.prices[kiteSymbol] = {
+                        ...marketDataService.prices[kiteSymbol],
+                        ltp: liveMarketPrice,
+                        symbol: kiteSymbol
+                    };
+                }
+            } catch (kiteErr) {
+                console.warn(`[placeOrder] ⚠️ Kite Quote Failed for ${symbol}:`, kiteErr.message);
+            }
+        }
+
+        // 3. Reject order if live price is unavailable (No Mock Fallback Allowed)
+        if (!liveMarketPrice) {
+            return res.status(400).json({ message: 'Kite Zerodha is not connected. Please login first.' });
+        }
+
+        const executionPrice = price ? parseFloat(price) : (order_type === 'MARKET' ? liveMarketPrice : 0);
+        let marginRequired = 0;
+
+        // Validate parsed values
+        if (isNaN(executionPrice) || executionPrice <= 0) {
+            return res.status(400).json({ message: 'Invalid price for the selected scrip' });
+        }
+        if (isNaN(qtyNum) || qtyNum <= 0) {
+            return res.status(400).json({ message: 'Quantity must be a positive number' });
+        }
+
+        // ─── DEMO ACCOUNT CHECK (TIER 2) ─────────────────────────────────────
+        if (clientConfig.isDemoAccount) {
+            return res.status(400).json({
+                message: `Trading is disabled for demo accounts. Please upgrade to a live account.`
+            });
+        }
+
+        // ─── SEGMENT ENABLE/DISABLE CHECK ─────────────────────────────────────
+        // Check if this segment is enabled in client config
+        if (marketType === 'MCX' && clientConfig.mcxTrading === false) {
+            return res.status(400).json({
+                message: `MCX Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        if (marketType === 'EQUITY' && clientConfig.equityTrading === false) {
+            return res.status(400).json({
+                message: `EQUITY Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        if (marketType === 'OPTIONS' && clientConfig.indexOptionsTrading === false && clientConfig.equityOptionsTrading === false && clientConfig.mcxOptionsTrading === false) {
+            return res.status(400).json({
+                message: `OPTIONS Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        if (marketType === 'COMEX' && clientConfig.comexTrading === false) {
+            return res.status(400).json({
+                message: `COMEX Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        if (marketType === 'FOREX' && clientConfig.forexTrading === false) {
+            return res.status(400).json({
+                message: `FOREX Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        if (marketType === 'CRYPTO' && clientConfig.cryptoTrading === false) {
+            return res.status(400).json({
+                message: `CRYPTO Trading is disabled for your account. Please enable it to trade.`
+            });
+        }
+        console.log('[placeOrder] ✅ Segment enabled check passed for:', marketType);
+
+        // ─── TIER 2: SCALPING STOP LOSS & SAME-SYMBOL HOLD TIME LOCK CHECK ───
+        let minTimeSecondsForScalping = 0;
+        if (marketType === 'MCX') minTimeSecondsForScalping = parseInt(clientConfig.mcxMinTimeToBookProfit || 0);
+        else if (marketType === 'EQUITY') minTimeSecondsForScalping = parseInt(clientConfig.equityMinTimeToBookProfit || 0);
+        else if (marketType === 'OPTIONS') minTimeSecondsForScalping = parseInt(clientConfig.optionsMinTimeToBookProfit || 0);
+        else if (marketType === 'CRYPTO') minTimeSecondsForScalping = parseInt((clientConfig.cryptoConfig || {}).minTimeToBookProfit || 0);
+        else if (marketType === 'FOREX') minTimeSecondsForScalping = parseInt((clientConfig.forexConfig || {}).minTimeToBookProfit || 0);
+        else if (marketType === 'COMEX') minTimeSecondsForScalping = parseInt((clientConfig.comexConfig || {}).minTimeToBookProfit || 0);
+
+        let scalpingStopLossEnabled = false;
+        if (marketType === 'MCX') scalpingStopLossEnabled = clientConfig.mcxScalpingStopLoss === 'Enabled';
+        else if (marketType === 'EQUITY') scalpingStopLossEnabled = clientConfig.equityScalpingStopLoss === 'Enabled';
+        else if (marketType === 'OPTIONS') scalpingStopLossEnabled = clientConfig.optionsScalpingStopLoss === 'Enabled';
+        else if (marketType === 'CRYPTO') scalpingStopLossEnabled = (clientConfig.cryptoConfig || {}).scalpingStopLoss === 'Enabled';
+        else if (marketType === 'FOREX') scalpingStopLossEnabled = (clientConfig.forexConfig || {}).scalpingStopLoss === 'Enabled';
+        else if (marketType === 'COMEX') scalpingStopLossEnabled = (clientConfig.comexConfig || {}).scalpingStopLoss === 'Enabled';
+
+        if (order_type !== 'MARKET' && !scalpingStopLossEnabled && minTimeSecondsForScalping > 0) {
+            // Check if there is any active (OPEN) trade of the same symbol for this user
+            const [activeSameSymbolTrades] = await db.execute(
+                'SELECT id, entry_time FROM trades WHERE user_id = ? AND symbol = ? AND status = "OPEN"',
+                [targetUserId, symbol]
+            );
+
+            for (const activeTrade of activeSameSymbolTrades) {
+                const activeEntryTime = new Date(activeTrade.entry_time);
+                const secondsHeldActive = Math.floor((new Date() - activeEntryTime) / 1000);
+                if (secondsHeldActive < minTimeSecondsForScalping) {
+                    const remaining = minTimeSecondsForScalping - secondsHeldActive;
+                    return res.status(400).json({
+                        message: `Scalping Stop Loss is Disabled. Multiple orders on the same symbol are blocked during hold time. Please wait ${remaining} seconds before re-entering.`
+                    });
+                }
+            }
+        }
+
+        // ─── PERMANENT SCRIP BAN CHECK ──────────────────────────────────────────
+        const [scripBan] = await db.execute('SELECT id FROM banned_scrips WHERE symbol = ?', [symbol]);
+        if (scripBan.length > 0) {
+            return res.status(400).json({
+                message: `Trading in ${symbol} is prohibited. Scrip is currently banned.`
+            });
+        }
+
+        // 5. Banned Limit Order Check (TIER 2 - Enhanced with EQUITY/OPTIONS/International)
+        console.log('[placeOrder] DEBUG - order_type:', order_type, 'marketType:', marketType, 'banMcxLimitOrder:', clientConfig.banMcxLimitOrder);
+
+        if (order_type !== 'MARKET') {
+            console.log('[placeOrder] DEBUG - Non-MARKET order detected, checking bans...');
+
+            // Check global ban
+            if (clientConfig.banAllSegmentLimitOrder) {
+                console.log('[placeOrder] Global limit order ban triggered');
+                return res.status(400).json({
+                    message: `Limit orders are disabled for all segments`
+                });
+            }
+
+            // Check segment-specific ban (MCX)
+            if (marketType === 'MCX' && clientConfig.banMcxLimitOrder) {
+                console.log('[placeOrder] MCX limit order ban triggered');
+                return res.status(400).json({
+                    message: `Limit orders are banned for MCX segment`
+                });
+            }
+
+            // Check segment-specific ban (EQUITY) - TIER 2
+            if (marketType === 'EQUITY' && clientConfig.banEquityLimitOrder) {
+                return res.status(400).json({
+                    message: `Limit orders are banned for EQUITY segment`
+                });
+            }
+
+            // Check segment-specific ban (OPTIONS) - TIER 2
+            if (marketType === 'OPTIONS' && clientConfig.banOptionsLimitOrder) {
+                return res.status(400).json({
+                    message: `Limit orders are banned for OPTIONS segment`
+                });
+            }
+
+            // Check international segment bans - TIER 2
+            if (marketType === 'COMEX' && clientConfig.comexConfig?.banLimitOrder) {
+                return res.status(400).json({
+                    message: `Limit orders are banned for COMEX segment`
+                });
+            }
+            if (marketType === 'FOREX' && clientConfig.forexConfig?.banLimitOrder) {
+                return res.status(400).json({
+                    message: `Limit orders are banned for FOREX segment`
+                });
+            }
+            if (marketType === 'CRYPTO' && clientConfig.cryptoConfig?.banLimitOrder) {
+                return res.status(400).json({
+                    message: `Limit orders are banned for CRYPTO segment`
+                });
+            }
+
+            // Check symbol-specific ban
+            const now = new Date();
+            const [bans] = await db.execute(
+                'SELECT id FROM banned_limit_orders WHERE scrip_id = ? AND start_time <= ? AND end_time >= ?',
+                [symbol, now, now]
+            );
+            if (bans.length > 0) {
+                return res.status(400).json({ message: `Limit orders are banned for ${symbol} during this time period` });
+            }
+        }
+
+        // ─── VALIDATE LOT SIZE LIMITS (PHASE 1) ──────────────────────────────
+        // MCX lot size validation
+        if (marketType === 'MCX') {
+            const minLot = parseInt(clientConfig.mcxMinLot || 1);
+            const maxLot = parseInt(clientConfig.mcxMaxLot || 100);
+
+            if (qtyNum < minLot) {
+                return res.status(400).json({
+                    message: `Minimum lot size for MCX is ${minLot}. You entered ${qtyNum}`
+                });
+            }
+            if (qtyNum > maxLot) {
+                return res.status(400).json({
+                    message: `Maximum lot size for MCX is ${maxLot}. You entered ${qtyNum}`
+                });
+            }
+
+            console.log(`[placeOrder] ✅ Lot size valid: Min=${minLot}, Max=${maxLot}, Qty=${qtyNum}`);
+
+            // ─── INSTRUMENT-SPECIFIC LOT SIZE VALIDATION ─────────────────────
+            // Check if qty exceeds the instrument's LOT value from mcxLotMargins
+            // Example: If GOLD has LOT=5, user can only place max 5 lots at a time
+            const baseSym = sym.toUpperCase();
+            const instrumentLotSize = parseInt(clientConfig?.mcxLotMargins?.[baseSym]?.LOT || 1);
+
+            if (qtyNum > instrumentLotSize) {
+                return res.status(400).json({
+                    message: `Maximum lot size for ${symbol} is ${instrumentLotSize}. You tried to place ${qtyNum} lots. Only ${instrumentLotSize} lot(s) allowed per trade.`
+                });
+            }
+
+            console.log(`[placeOrder] ✅ Instrument lot validation: ${symbol} LOT=${instrumentLotSize}, Qty=${qtyNum}`);
+        }
+
+        // EQUITY lot size validation
+        if (marketType === 'EQUITY') {
+            const minLot = parseInt(clientConfig.equityMinLot || 1);
+            const maxLot = parseInt(clientConfig.equityMaxLot || 100);
+
+            if (qtyNum < minLot) {
+                return res.status(400).json({
+                    message: `Minimum lot size for Equity is ${minLot}. You entered ${qtyNum}`
+                });
+            }
+            if (qtyNum > maxLot) {
+                return res.status(400).json({
+                    message: `Maximum lot size for Equity is ${maxLot}. You entered ${qtyNum}`
+                });
+            }
+        }
+
+        // ─── MAX LOT PER SCRIPT VALIDATION (TIER 2) ───────────────────────────
+        // Check if adding this trade would exceed per-symbol lot limit
+        if (marketType === 'MCX') {
+            const maxLotScrip = parseInt(clientConfig.mcxMaxLotScrip || 0);
+            if (maxLotScrip > 0) {
+                const [openSymbolTrades] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ?',
+                    [targetUserId, symbol]
+                );
+                const currentQtyForSymbol = parseInt(openSymbolTrades[0]?.total_qty || 0);
+                const newTotalForSymbol = currentQtyForSymbol + qtyNum;
+
+                if (newTotalForSymbol > maxLotScrip) {
+                    return res.status(400).json({
+                        message: `Max lot size for ${symbol} is ${maxLotScrip}. Current: ${currentQtyForSymbol}, New trade: ${qtyNum}, Total would be: ${newTotalForSymbol}`
+                    });
+                }
+                console.log(`[placeOrder] ✅ Max lot per script (MCX): Symbol=${symbol}, Limit=${maxLotScrip}, Current=${currentQtyForSymbol}, New=${qtyNum}`);
+            }
+        }
+
+        if (marketType === 'EQUITY') {
+            const maxLotScrip = parseInt(clientConfig.equityMaxScrip || 0);
+            if (maxLotScrip > 0) {
+                const [openSymbolTrades] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ?',
+                    [targetUserId, symbol]
+                );
+                const currentQtyForSymbol = parseInt(openSymbolTrades[0]?.total_qty || 0);
+                const newTotalForSymbol = currentQtyForSymbol + qtyNum;
+
+                if (newTotalForSymbol > maxLotScrip) {
+                    return res.status(400).json({
+                        message: `Max lot size for ${symbol} is ${maxLotScrip}. Current: ${currentQtyForSymbol}, New trade: ${qtyNum}, Total would be: ${newTotalForSymbol}`
+                    });
+                }
+                console.log(`[placeOrder] ✅ Max lot per script (EQUITY): Symbol=${symbol}, Limit=${maxLotScrip}, Current=${currentQtyForSymbol}, New=${qtyNum}`);
+            }
+        }
+
+        // ─── VALIDATE MAX POSITION SIZE ──────────────────────────────────────
+        // Check if total open position would exceed max
+        if (marketType === 'MCX') {
+            const maxSizeAll = parseInt(clientConfig.mcxMaxSizeAll || 5000);
+            const [openTrades] = await db.execute(
+                'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "MCX"',
+                [targetUserId]
+            );
+            const currentOpenQty = parseInt(openTrades[0]?.total_qty || 0);
+            const newTotal = currentOpenQty + qtyNum;
+
+            if (newTotal > maxSizeAll) {
+                return res.status(400).json({
+                    message: `Total MCX position limit is ${maxSizeAll}. Current: ${currentOpenQty}, New trade: ${qtyNum}, Total would be: ${newTotal}`
+                });
+            }
+            console.log(`[placeOrder] ✅ Max position check passed: Current=${currentOpenQty}, Adding=${qtyNum}, Limit=${maxSizeAll}`);
+        }
+
+        if (marketType === 'EQUITY') {
+            const maxSizeAll = parseInt(clientConfig.equityMaxSizeAll || 2000);
+            const [openTrades] = await db.execute(
+                'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "EQUITY"',
+                [targetUserId]
+            );
+            const currentOpenQty = parseInt(openTrades[0]?.total_qty || 0);
+            const newTotal = currentOpenQty + qtyNum;
+
+            if (newTotal > maxSizeAll) {
+                return res.status(400).json({
+                    message: `Total Equity position limit is ${maxSizeAll}. Current: ${currentOpenQty}, New trade: ${qtyNum}, Total would be: ${newTotal}`
+                });
+            }
+        }
+
+        // ─── SEGMENT LIMIT VALIDATION (TIER 2) - Max position VALUE per segment ─
+        // Check if total position value in segment would exceed limit
+        if (marketType === 'MCX') {
+            const segmentLimit = parseInt(clientConfig.mcxSegmentLimit || 0);
+            if (segmentLimit > 0) {
+                const [segmentValue] = await db.execute(
+                    'SELECT COALESCE(SUM(entry_price * qty), 0) as total_value FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "MCX"',
+                    [targetUserId]
+                );
+                const currentValue = parseFloat(segmentValue[0]?.total_value || 0);
+                const newTradeValue = executionPrice * qtyNum;
+                const newTotal = currentValue + newTradeValue;
+
+                if (newTotal > segmentLimit) {
+                    return res.status(400).json({
+                        message: `MCX segment limit is ₹${segmentLimit.toFixed(2)}. Current value: ₹${currentValue.toFixed(2)}, New trade: ₹${newTradeValue.toFixed(2)}, Total would be: ₹${newTotal.toFixed(2)}`
+                    });
+                }
+                console.log(`[placeOrder] ✅ Segment limit (MCX): Limit=₹${segmentLimit}, Current=₹${currentValue.toFixed(2)}, NewTrade=₹${newTradeValue.toFixed(2)}`);
+            }
+        }
+
+
+
+        // ─── ALLOW FRESH ENTRY CHECK (TIER 2) ───────────────────────────────
+        // If allowFreshEntry is disabled, block new entries when losses exceed threshold
+        if (!clientConfig.allowFreshEntry) {
+            const [allOpenTrades] = await db.execute(
+                'SELECT COALESCE(SUM(pnl), 0) as total_pnl FROM trades WHERE user_id = ? AND status = "OPEN"',
+                [targetUserId]
+            );
+            const totalOpenPnL = parseFloat(allOpenTrades[0]?.total_pnl || 0);
+            const userBalance = parseFloat(targetUser.balance || 0);
+
+            if (totalOpenPnL < 0 && userBalance > 0) {
+                const lossPercentage = Math.abs(totalOpenPnL) / userBalance * 100;
+                // Block entries if loss > 20% (configurable threshold)
+                if (lossPercentage > 20) {
+                    return res.status(400).json({
+                        message: `New entries are blocked. Current loss: ${lossPercentage.toFixed(2)}%. Please close losing positions first.`
+                    });
+                }
+            }
+        }
+
+        // 6. Expiry Rules Check
+        const [scripRows] = await db.execute('SELECT expiry_date FROM scrip_data WHERE symbol = ?', [symbol]);
+        const [expiryRuleRows] = await db.execute('SELECT * FROM expiry_rules WHERE id = 1');
+        const expiryRule = expiryRuleRows[0];
+        const scrip = scripRows[0];
+
+        if (expiryRule && scrip && scrip.expiry_date) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const expiryDate = new Date(scrip.expiry_date);
+            expiryDate.setHours(0, 0, 0, 0);
+            const daysLeft = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+
+            // Days before expiry check
+            const stopDays = parseInt(expiryRule.days_before_expiry) || 0;
+            if (stopDays > 0 && daysLeft <= stopDays && expiryRule.allow_expiring_scrip === 'No') {
+                return res.status(400).json({
+                    message: `${symbol} expires in ${daysLeft} day(s). New orders are not allowed within ${stopDays} days of expiry.`
+                });
+            }
+
+            // Away points check for limit orders (TIER 2 - Enhanced with segment-specific limits)
+            if (order_type !== 'MARKET' && price) {
+                // Get real price from MarketDataService or Kite (No Mock Fallback Allowed)
+                let currentPriceNow = null;
+                const searchPatterns = [symbol, `MCX:${symbol}`, `NFO:${symbol}`, `NSE:${symbol}`];
+                for (const p of searchPatterns) {
+                    const data = marketDataService.getPrice(p);
+                    if (data && data.ltp) {
+                        currentPriceNow = data.ltp;
+                        break;
+                    }
+                }
+
+                const kiteService = require('../utils/kiteService');
+                if (!currentPriceNow && kiteService.isAuthenticated()) {
+                    try {
+                        const kiteSym = symbol.includes(':') ? symbol : (marketType === 'MCX' ? `MCX:${symbol}` : (marketType === 'EQUITY' ? `NSE:${symbol}` : `NFO:${symbol}`));
+                        const quoteRes = await kiteService.getQuote(kiteSym);
+                        const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
+                        if (quote && quote.last_price) {
+                            currentPriceNow = quote.last_price;
+                        }
+                    } catch (e) {
+                        console.warn(`[placeOrder] Kite Quote Failed for ${symbol} during away-points check:`, e.message);
+                    }
+                }
+
+                if (!currentPriceNow) {
+                    return res.status(400).json({ message: 'Kite Zerodha is not connected. Please login first.' });
+                }
+
+                const diff = Math.abs(parseFloat(price) - currentPriceNow);
+
+                // Check expiry rule away points first (if configured)
+                let maxAllowedAway = 0;
+                if (expiryRule) {
+                    const awayPoints = expiryRule.away_points ? JSON.parse(expiryRule.away_points) : {};
+                    maxAllowedAway = parseFloat(awayPoints[symbol] || 0);
+                }
+
+                // Also check segment-specific away points from client config
+                let segmentOrdersAway = 0;
+                if (marketType === 'MCX') {
+                    segmentOrdersAway = parseInt(clientConfig.mcxOrdersAway || 0);
+                } else if (marketType === 'EQUITY') {
+                    segmentOrdersAway = parseInt(clientConfig.equityOrdersAway || 0);
+                } else if (marketType === 'OPTIONS') {
+                    segmentOrdersAway = parseInt(clientConfig.optionsOrdersAway || 0);
+                } else if (marketType === 'COMEX') {
+                    segmentOrdersAway = parseInt(clientConfig.comexConfig?.ordersAway || 0);
+                } else if (marketType === 'FOREX') {
+                    segmentOrdersAway = parseInt(clientConfig.forexConfig?.ordersAway || 0);
+                } else if (marketType === 'CRYPTO') {
+                    segmentOrdersAway = parseInt(clientConfig.cryptoConfig?.ordersAway || 0);
+                }
+
+                // Use the stricter limit (whichever is lower)
+                const effectiveLimit = Math.max(maxAllowedAway, segmentOrdersAway);
+                if (effectiveLimit > 0 && diff > effectiveLimit) {
+                    return res.status(400).json({
+                        message: `Limit order price too far from market. Max ${effectiveLimit} points away. Current: ${currentPriceNow}, Your price: ${price}`
+                    });
+                }
+            }
+        }
+
+        // 7. Calculate Margin Required with Lot Size
+        // ══════════════════════════════════════════════════════════════════
+        // MCX LOT SIZES (100% Complete - DO NOT MODIFY)
+        // ══════════════════════════════════════════════════════════════════
+        const MCX_LOT_SIZES = {
+            'GOLD': 100, 'GOLDM': 10, 'GOLDGUINEA': 8, 'GOLDPETAL': 1, 'MGOLD': 10,
+            'SILVER': 30, 'SILVERM': 5, 'SILVERMIC': 1, 'MSILVER': 5,
+            'CRUDEOIL': 100, 'CRUDEOILM': 10, 'MCRUDEOIL': 10,
+            'NATURALGAS': 1250, 'NATGASMINI': 250, 'MNATURALGAS': 250,
+            'COPPER': 2500, 'MCOPPER': 500,
+            'ZINC': 5000, 'ZINCMINI': 1000, 'MZINC': 1000,
+            'LEAD': 5000, 'LEADMINI': 1000, 'MLEAD': 1000,
+            'NICKEL': 1500, 'NICKELMINI': 100,
+            'ALUMINIUM': 5000, 'ALUMINI': 1000, 'MALUMINIUM': 1000,
+            'MENTHAOIL': 360, 'COTTON': 25, 'BULLDEX': 1,
+        };
+
+        let lotSize = 1;
+        try {
+            // ══════════════════════════════════════════════════════════════════
+            // MCX LOT SIZE LOGIC
+            // ══════════════════════════════════════════════════════════════════
+            if (marketType === 'MCX') {
+                // 1. Priority: User Specific Dynamic Lot Size (from UI/Config)
+                if (clientConfig && clientConfig.mcxLotMargins) {
+                    const base = getMcxBaseScrip(symbol) || symbol.toUpperCase();
+                    const configLot = clientConfig.mcxLotMargins[base]?.LOT || clientConfig.mcxLotMargins[symbol.toUpperCase()]?.LOT;
+                    if (configLot && parseFloat(configLot) > 0) {
+                        lotSize = parseFloat(configLot);
+                        console.log(`[placeOrder] 🎯 MCX Dynamic Lot Size from Config: ${symbol} → ${lotSize}`);
+                    } else {
+                        // 2. Hardcoded MCX Lot Sizes
+                        const baseFallback = getMcxBaseScrip(symbol);
+                        if (baseFallback && MCX_LOT_SIZES[baseFallback]) {
+                            lotSize = MCX_LOT_SIZES[baseFallback];
+                            console.log(`[placeOrder] 📊 MCX Lot Size (Hardcoded): ${symbol} → ${lotSize}`);
+                        } else {
+                            lotSize = 1;
+                        }
+                    }
+                } else {
+                    // Classic flow if config missing
+                    const base = getMcxBaseScrip(symbol);
+                    if (base && MCX_LOT_SIZES[base]) {
+                        lotSize = MCX_LOT_SIZES[base];
+                        console.log(`[placeOrder] 📊 MCX Lot Size (Hardcoded): ${symbol} → ${lotSize}`);
+                    } else {
+                        lotSize = 1;
+                    }
+                }
+            }
+            // ══════════════════════════════════════════════════════════════════
+            // EQUITY (NSE) LOT SIZE LOGIC
+            // ══════════════════════════════════════════════════════════════════
+            else if (marketType === 'EQUITY') {
+                // For Equity, check database first, default to 1 (individual shares)
+                const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [symbol]);
+                if (scripRows.length > 0) {
+                    lotSize = parseFloat(scripRows[0].lot_size) || 1;
+                    console.log(`[placeOrder] 💰 EQUITY Lot Size (from DB): ${symbol} → ${lotSize}`);
+                } else {
+                    // Default: Equity is traded in individual shares (lot size = 1)
+                    lotSize = 1;
+                    console.log(`[placeOrder] 💰 EQUITY Lot Size (default): ${symbol} → 1`);
+                }
+            }
+            // ══════════════════════════════════════════════════════════════════
+            // OTHER SEGMENTS (NFO, OPTIONS, etc.)
+            // ══════════════════════════════════════════════════════════════════
+            else {
+                const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [symbol]);
+                if (scripRows.length > 0 && parseFloat(scripRows[0].lot_size) > 0) {
+                    lotSize = parseFloat(scripRows[0].lot_size);
+                    console.log(`[placeOrder] 📋 ${marketType} Lot Size (from DB): ${symbol} → ${lotSize}`);
+                } else {
+                    lotSize = 1;
+                }
+            }
+        } catch (e) {
+            console.error('Error fetching lotSize for margin:', e);
+            lotSize = 1;
+        }
+
+        // ─── CALCULATE MARGIN WITH MARGIN SERVICE (Supports both PER_LOT_BASIS and PER_TURNOVER_BASIS) ──
+        let marginConfig = null;  // ✅ DECLARE OUTSIDE try-catch so it's accessible later!
+        let exposureTypeUsed = mcxExposureType || clientConfig?.mcxExposureType || 'PER_LOT_BASIS';  // ✅ PRIORITY ORDER!
+
+        // Normalize exposure type
+        if (exposureTypeUsed === 'per_lot') {
+            exposureTypeUsed = 'PER_LOT_BASIS';
+        } else if (exposureTypeUsed === 'per_crore' || exposureTypeUsed === 'per_turnover') {
+            exposureTypeUsed = 'PER_TURNOVER_BASIS';
+        }
+
+        try {
+            marginConfig = MarginService.getMarginConfig(sym, marketType, clientConfig, mcxExposureType);  // ✅ PASS mcxExposureType!
+            marginRequired = MarginService.calculateRequiredMargin({
+                qty: qtyNum,
+                price: executionPrice,
+                marginConfig: marginConfig,
+                tradeType: tradeType,  // ✅ USE REQUEST VALUE (from req.body)!
+                lotSize: lotSize
+            });
+            exposureTypeUsed = marginConfig.exposureType;
+            console.log(`[placeOrder] ✅ Margin calculated via MarginService (${marginConfig.exposureType}): ₹${marginRequired.toFixed(2)}`);
+        } catch (marginErr) {
+            // 🔴 STRICT FALLBACK - RESPECT THE SELECTED EXPOSURE TYPE!
+            console.warn(`[placeOrder] MarginService error, using fallback: ${marginErr.message}`);
+            console.log(`[placeOrder] DEBUG - Falling back with exposureType: ${exposureTypeUsed}`);
+
+            if (exposureTypeUsed === 'PER_TURNOVER_BASIS' || exposureTypeUsed === 'per_turnover') {
+                // ✅ PER_TURNOVER_BASIS: margin = (price × qty) / exposure
+                const exposure = parseInt(clientConfig?.mcxIntradayMargin || 500);
+                const turnover = executionPrice * qtyNum * lotSize;
+                marginRequired = turnover / exposure;
+                console.log(`[placeOrder] Fallback PER_TURNOVER_BASIS: (${executionPrice} × ${qtyNum}) / ${exposure} = ₹${marginRequired.toFixed(2)}`);
+            } else {
+                // ✅ PER_LOT_BASIS: margin = qty × marginPerLot
+                let marginPerLot = 0;
+
+                if (marketType === 'MCX') {
+                    const baseSym = getMcxBaseScrip(sym) || sym;
+                    marginPerLot = parseFloat(clientConfig?.mcxLotMargins?.[baseSym]?.INTRADAY || 0);
+
+                    if (marginPerLot <= 0) {
+                        // Fallback to per-crore calculation if no lot margin configured
+                        console.warn(`[placeOrder] No INTRADAY margin for ${baseSym}, using exposure fallback`);
+                        const exposure = parseInt(clientConfig?.mcxIntradayMargin || 500);
+                        const turnover = executionPrice * qtyNum * lotSize;
+                        marginRequired = turnover / exposure;
+                    } else {
+                        marginRequired = qtyNum * marginPerLot;
+                        console.log(`[placeOrder] Fallback PER_LOT_BASIS: ${qtyNum} × ₹${marginPerLot} = ₹${marginRequired.toFixed(2)}`);
+                    }
+                } else if (marketType === 'EQUITY') {
+                    const baseSym = sym.toUpperCase();
+                    marginPerLot = parseFloat(clientConfig?.equityLotMargins?.[baseSym]?.INTRADAY || 0);
+
+                    if (marginPerLot <= 0) {
+                        const exposure = parseInt(clientConfig?.equityIntradayMargin || 500);
+                        const turnover = executionPrice * qtyNum * lotSize;
+                        marginRequired = turnover / exposure;
+                    } else {
+                        marginRequired = qtyNum * marginPerLot;
+                    }
+                } else {
+                    marginRequired = (executionPrice * qtyNum * lotSize) * 0.1;
+                    console.log(`[placeOrder] Fallback DEFAULT (10%): ₹${marginRequired.toFixed(2)}`);
+                }
+            }
+
+            // ✅ CREATE FALLBACK marginConfig WITH exposureType
+            marginConfig = {
+                exposureType: exposureTypeUsed,
+                INTRADAY: 0,
+                HOLDING: 0,
+                intradayExposure: parseFloat(clientConfig?.mcxIntradayMargin || 500),
+                holdingExposure: parseFloat(clientConfig?.mcxHoldingMargin || 100),
+                LOT: lotSize
+            };
+
+            console.log(`[placeOrder] ⚠️  Using fallback margin: ₹${marginRequired.toFixed(2)} (${exposureTypeUsed})`);
+        }
+
+        // Ensure margin is calculated
+        if (marginRequired <= 0) {
+            marginRequired = (executionPrice * qtyNum * lotSize) * 0.1; // 10% default
+        }
+
+        // 8. Balance Check with calculated margin
+        if (targetUser.balance < marginRequired) {
+            const avail = parseFloat(targetUser.balance || 0).toFixed(2);
+            return res.status(400).json({
+                message: `Insufficient balance. Required margin: ₹${marginRequired.toFixed(2)}, Available: ₹${avail}`,
+                required: marginRequired.toFixed(2),
+                available: avail
+            });
+        }
+
+        // ─── BROKER SEGMENT VALIDATION ─────────────────────────────────────
+        // Get client's broker info and validate against broker's CURRENT segment config
+        const [clientSettings] = await db.execute(
+            'SELECT broker_id FROM client_settings WHERE user_id = ?',
+            [targetUserId]
+        );
+
+        if (clientSettings.length > 0 && clientSettings[0].broker_id) {
+            const brokerIdForClient = clientSettings[0].broker_id;
+            try {
+                // Fetch CURRENT broker config (not cached client config)
+                const [brokerSharesRows] = await db.execute(
+                    'SELECT segments_json FROM broker_shares WHERE user_id = ?',
+                    [brokerIdForClient]
+                );
+
+                if (brokerSharesRows.length > 0 && brokerSharesRows[0].segments_json) {
+                    const brokerSegments = JSON.parse(brokerSharesRows[0].segments_json);
+                    const brokerSegmentConfig = brokerSegments.segmentConfig || {};
+
+                    // Determine segment key based on market type
+                    let segmentKey = null;
+                    if (marketType === 'MCX') {
+                        segmentKey = 'mcx_all_future';
+                    } else if (marketType === 'COMEX') {
+                        segmentKey = 'comex_commodity_future';
+                    } else if (marketType === 'FOREX') {
+                        segmentKey = 'forex';
+                    } else if (marketType === 'CRYPTO') {
+                        segmentKey = 'crypto';
+                    } else if (marketType === 'EQUITY') {
+                        segmentKey = 'equity';
+                    }
+
+                    // Check if segment is enabled for this broker (LIVE check)
+                    if (segmentKey && brokerSegmentConfig[segmentKey]) {
+                        const segConfig = brokerSegmentConfig[segmentKey];
+                        if (!segConfig.enabled) {
+                            return res.status(403).json({
+                                message: `Trading disabled for ${marketType} segment by your broker`
+                            });
+                        }
+                        console.log(`[placeOrder] ✅ ${marketType} segment enabled for broker ${brokerIdForClient}`);
+                    }
+                }
+            } catch (e) {
+                console.error('[placeOrder] Error validating broker segment config:', e);
+                // Continue - validation error shouldn't block the trade
+            }
+        }
+
+        // ─── SHORT SELLING VALIDATION (TIER 2) ────────────────────────────────
+        // Check if short selling (SELL orders) is allowed for this segment
+        if (type.toUpperCase() === 'SELL') {
+            let isShortSellingAllowed = true;
+            let deniedReason = '';
+
+            if (marketType === 'OPTIONS') {
+                // For options, check specific short selling flags based on sub-segment
+                if (symbol.includes('NIFTY') || symbol.includes('BANKNIFTY')) {
+                    isShortSellingAllowed = clientConfig.optionsIndexShortSelling === 'Yes';
+                    if (!isShortSellingAllowed) deniedReason = 'Options Index';
+                } else if (symbol.includes('MCX') || symbol.includes('GOLD') || symbol.includes('SILVER')) {
+                    isShortSellingAllowed = clientConfig.optionsMcxShortSelling === 'Yes';
+                    if (!isShortSellingAllowed) deniedReason = 'Options MCX';
+                } else {
+                    isShortSellingAllowed = clientConfig.optionsEquityShortSelling === 'Yes';
+                    if (!isShortSellingAllowed) deniedReason = 'Options Equity';
+                }
+            }
+
+            if (!isShortSellingAllowed) {
+                return res.status(400).json({
+                    message: `Short selling is not allowed for ${deniedReason || marketType} segment in your account`
+                });
+            }
+        }
+
+        // ─── TIER 3: OPTIONS-SPECIFIC VALIDATIONS ──────────────────────────────
+        if (marketType === 'OPTIONS') {
+            // Options Min Bid Price check
+            const optionsMinBidPrice = parseFloat(clientConfig.optionsMinBidPrice || 1);
+            if (price && parseFloat(price) < optionsMinBidPrice) {
+                return res.status(400).json({
+                    message: `Minimum bid price for options is ₹${optionsMinBidPrice}. Your price: ₹${price}`
+                });
+            }
+
+            // Determine options sub-segment and apply lot limits
+            let maxLotConfig = 0;
+            let maxLotScripConfig = 0;
+            let marginIntradayConfig = 0;
+            let marginHoldingConfig = 0;
+
+            if (symbol.includes('NIFTY') || symbol.includes('BANKNIFTY')) {
+                // Index options
+                maxLotConfig = parseInt(clientConfig.optionsIndexMaxLot || 20);
+                maxLotScripConfig = parseInt(clientConfig.optionsIndexMaxScrip || 200);
+                marginIntradayConfig = parseInt(clientConfig.optionsIndexIntraday || 5);
+                marginHoldingConfig = parseInt(clientConfig.optionsIndexHolding || 2);
+            } else if (symbol.includes('MCX')) {
+                // MCX options
+                maxLotConfig = parseInt(clientConfig.optionsMcxMaxLot || 50);
+                maxLotScripConfig = parseInt(clientConfig.optionsMcxMaxScrip || 200);
+                marginIntradayConfig = parseInt(clientConfig.optionsMcxIntraday || 5);
+                marginHoldingConfig = parseInt(clientConfig.optionsMcxHolding || 2);
+            } else {
+                // Equity options
+                maxLotConfig = parseInt(clientConfig.optionsEquityMaxLot || 50);
+                maxLotScripConfig = parseInt(clientConfig.optionsEquityMaxScrip || 200);
+                marginIntradayConfig = parseInt(clientConfig.optionsEquityIntraday || 5);
+                marginHoldingConfig = parseInt(clientConfig.optionsEquityHolding || 2);
+            }
+
+            // Check lot size limits for options
+            if (qtyNum < parseInt(clientConfig.optionsEquityMinLot || 0)) {
+                return res.status(400).json({
+                    message: `Minimum lot size for OPTIONS is ${clientConfig.optionsEquityMinLot || 1}. You entered ${qtyNum}`
+                });
+            }
+            if (qtyNum > maxLotConfig) {
+                return res.status(400).json({
+                    message: `Maximum lot size for OPTIONS is ${maxLotConfig}. You entered ${qtyNum}`
+                });
+            }
+
+            // Check max lots per script for options
+            const [openOptionsForSymbol] = await db.execute(
+                'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ? AND market_type = "OPTIONS"',
+                [targetUserId, symbol]
+            );
+            const currentOptionsQtyForSymbol = parseInt(openOptionsForSymbol[0]?.total_qty || 0);
+            const newOptionsTotalForSymbol = currentOptionsQtyForSymbol + qtyNum;
+
+            if (newOptionsTotalForSymbol > maxLotScripConfig) {
+                return res.status(400).json({
+                    message: `Max lot size for ${symbol} is ${maxLotScripConfig}. Current: ${currentOptionsQtyForSymbol}, New: ${qtyNum}, Total would be: ${newOptionsTotalForSymbol}`
+                });
+            }
+
+            // Check max options position size
+            let maxOptionsSizeAll = 200;
+            if (symbol.includes('NIFTY') || symbol.includes('BANKNIFTY')) {
+                maxOptionsSizeAll = parseInt(clientConfig.optionsMaxIndexSizeAll || 200);
+            } else if (symbol.includes('MCX')) {
+                maxOptionsSizeAll = parseInt(clientConfig.optionsMaxMcxSizeAll || 200);
+            } else {
+                maxOptionsSizeAll = parseInt(clientConfig.optionsMaxEquitySizeAll || 200);
+            }
+
+            const [openAllOptions] = await db.execute(
+                'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "OPTIONS"',
+                [targetUserId]
+            );
+            const currentAllOptionsQty = parseInt(openAllOptions[0]?.total_qty || 0);
+            const newAllOptionsTotal = currentAllOptionsQty + qtyNum;
+
+            if (newAllOptionsTotal > maxOptionsSizeAll) {
+                return res.status(400).json({
+                    message: `Max OPTIONS position limit is ${maxOptionsSizeAll}. Current: ${currentAllOptionsQty}, New: ${qtyNum}, Total would be: ${newAllOptionsTotal}`
+                });
+            }
+
+            // Log options validations passed
+            console.log(`[placeOrder] ✅ OPTIONS validations: Lot=${qtyNum}, MaxLot=${maxLotConfig}, MaxPerScript=${maxLotScripConfig}, MaxAll=${maxOptionsSizeAll}`);
+        }
+
+        // ─── TIER 3: KYC VERIFICATION CHECK ────────────────────────────────────
+        // Check if account has valid KYC status for trading
+        try {
+            const [kycStatus] = await db.execute(
+                'SELECT kyc_status FROM users WHERE id = ?',
+                [targetUserId]
+            );
+            if (kycStatus.length > 0) {
+                const userKycStatus = kycStatus[0].kyc_status || 'Pending';
+                if (userKycStatus === 'Rejected' || userKycStatus === 'Pending') {
+                    return res.status(403).json({
+                        message: `Your KYC status is ${userKycStatus}. Please complete KYC verification to trade.`
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('[placeOrder] KYC check error:', e);
+            // Continue if KYC column doesn't exist yet
+        }
+
+        // ─── TIER 3: INTERNATIONAL SEGMENT VALIDATIONS ──────────────────────────
+        // Apply segment-specific lot size and position validations
+        if (marketType === 'COMEX' && clientConfig.comexTrading) {
+            const comexConfig = clientConfig.comexConfig || {};
+            const minLot = parseInt(comexConfig.minLot || 1);
+            const maxLot = parseInt(comexConfig.maxLot || 100);
+
+            if (qtyNum < minLot) {
+                return res.status(400).json({
+                    message: `Minimum lot size for COMEX is ${minLot}. You entered ${qtyNum}`
+                });
+            }
+            if (qtyNum > maxLot) {
+                return res.status(400).json({
+                    message: `Maximum lot size for COMEX is ${maxLot}. You entered ${qtyNum}`
+                });
+            }
+
+            // Check max per script
+            const comexMaxLotScrip = parseInt(comexConfig.maxLotScrip || 0);
+            if (comexMaxLotScrip > 0) {
+                const [openComexForSymbol] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ? AND market_type = "COMEX"',
+                    [targetUserId, symbol]
+                );
+                const currentComexQty = parseInt(openComexForSymbol[0]?.total_qty || 0);
+                if (currentComexQty + qtyNum > comexMaxLotScrip) {
+                    return res.status(400).json({
+                        message: `Max lot size for ${symbol} (COMEX) is ${comexMaxLotScrip}`
+                    });
+                }
+            }
+
+            // Check max position size
+            const comexMaxSizeAll = parseInt(comexConfig.maxSizeAll || 0);
+            if (comexMaxSizeAll > 0) {
+                const [openComexAll] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "COMEX"',
+                    [targetUserId]
+                );
+                const currentComexAll = parseInt(openComexAll[0]?.total_qty || 0);
+                if (currentComexAll + qtyNum > comexMaxSizeAll) {
+                    return res.status(400).json({
+                        message: `Max COMEX position limit is ${comexMaxSizeAll}. Current: ${currentComexAll}, New: ${qtyNum}`
+                    });
+                }
+            }
+            console.log(`[placeOrder] ✅ COMEX validations passed`);
+        }
+
+        if (marketType === 'FOREX' && clientConfig.forexTrading) {
+            const forexConfig = clientConfig.forexConfig || {};
+            const minLot = parseInt(forexConfig.minLot || 1);
+            const maxLot = parseInt(forexConfig.maxLot || 100);
+
+            if (qtyNum < minLot || qtyNum > maxLot) {
+                return res.status(400).json({
+                    message: `FOREX lot size must be between ${minLot} and ${maxLot}. You entered ${qtyNum}`
+                });
+            }
+
+            // Check max per script
+            const forexMaxLotScrip = parseInt(forexConfig.maxLotScrip || 0);
+            if (forexMaxLotScrip > 0) {
+                const [openForexForSymbol] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ? AND market_type = "FOREX"',
+                    [targetUserId, symbol]
+                );
+                const currentForexQty = parseInt(openForexForSymbol[0]?.total_qty || 0);
+                if (currentForexQty + qtyNum > forexMaxLotScrip) {
+                    return res.status(400).json({
+                        message: `Max lot size for ${symbol} (FOREX) is ${forexMaxLotScrip}`
+                    });
+                }
+            }
+
+            // Check max position size
+            const forexMaxSizeAll = parseInt(forexConfig.maxSizeAll || 0);
+            if (forexMaxSizeAll > 0) {
+                const [openForexAll] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "FOREX"',
+                    [targetUserId]
+                );
+                const currentForexAll = parseInt(openForexAll[0]?.total_qty || 0);
+                if (currentForexAll + qtyNum > forexMaxSizeAll) {
+                    return res.status(400).json({
+                        message: `Max FOREX position limit is ${forexMaxSizeAll}`
+                    });
+                }
+            }
+            console.log(`[placeOrder] ✅ FOREX validations passed`);
+        }
+
+        if (marketType === 'CRYPTO' && clientConfig.cryptoTrading) {
+            const cryptoConfig = clientConfig.cryptoConfig || {};
+            const minLot = parseInt(cryptoConfig.minLot || 1);
+            const maxLot = parseInt(cryptoConfig.maxLot || 100);
+
+            if (qtyNum < minLot || qtyNum > maxLot) {
+                return res.status(400).json({
+                    message: `CRYPTO lot size must be between ${minLot} and ${maxLot}. You entered ${qtyNum}`
+                });
+            }
+
+            // Check max per script
+            const cryptoMaxLotScrip = parseInt(cryptoConfig.maxLotScrip || 0);
+            if (cryptoMaxLotScrip > 0) {
+                const [openCryptoForSymbol] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND symbol = ? AND market_type = "CRYPTO"',
+                    [targetUserId, symbol]
+                );
+                const currentCryptoQty = parseInt(openCryptoForSymbol[0]?.total_qty || 0);
+                if (currentCryptoQty + qtyNum > cryptoMaxLotScrip) {
+                    return res.status(400).json({
+                        message: `Max lot size for ${symbol} (CRYPTO) is ${cryptoMaxLotScrip}`
+                    });
+                }
+            }
+
+            // Check max position size
+            const cryptoMaxSizeAll = parseInt(cryptoConfig.maxSizeAll || 0);
+            if (cryptoMaxSizeAll > 0) {
+                const [openCryptoAll] = await db.execute(
+                    'SELECT COALESCE(SUM(qty), 0) as total_qty FROM trades WHERE user_id = ? AND status = "OPEN" AND market_type = "CRYPTO"',
+                    [targetUserId]
+                );
+                const currentCryptoAll = parseInt(openCryptoAll[0]?.total_qty || 0);
+                if (currentCryptoAll + qtyNum > cryptoMaxSizeAll) {
+                    return res.status(400).json({
+                        message: `Max CRYPTO position limit is ${cryptoMaxSizeAll}`
+                    });
+                }
+            }
+            console.log(`[placeOrder] ✅ CRYPTO validations passed`);
+        }
+
+        // ─── TIER 3: AUTO SQUARE-OFF AT EXPIRY CHECK ──────────────────────────
+        // Check if order is being placed too close to expiry
+        if (clientConfig.autoSquareOff === 'Yes') {
+            try {
+                const [expiryData] = await db.execute(
+                    'SELECT expiry_date FROM scrip_data WHERE symbol = ?',
+                    [symbol]
+                );
+                if (expiryData.length > 0 && expiryData[0].expiry_date) {
+                    const expiryDate = new Date(expiryData[0].expiry_date);
+                    const now = new Date();
+                    const timeUntilExpiry = expiryDate - now;
+                    const hoursUntilExpiry = timeUntilExpiry / (1000 * 60 * 60);
+
+                    // Parse square off time (e.g., "11:30")
+                    const squareOffTime = clientConfig.expirySquareOffTime || '11:30';
+                    const [squareOffHour, squareOffMin] = squareOffTime.split(':').map(Number);
+
+                    // Log auto square-off info
+                    console.log(`[placeOrder] ℹ️ Auto square-off check: ExpiryIn=${hoursUntilExpiry.toFixed(1)}h, SquareOffAt=${squareOffTime}`);
+                }
+            } catch (e) {
+                console.error('[placeOrder] Auto square-off check error:', e);
+            }
+        }
+
+        console.log('Executing with:', { targetUserId, symbol, type, executionPrice, marginRequired, marketType });
+
+        // 8. Insert Trade
+        // ✅ SAFETY CHECK: Ensure marginConfig exists and has exposureType
+        if (!marginConfig || !marginConfig.exposureType) {
+            console.error('❌ CRITICAL: marginConfig missing exposureType!', { marginConfig, tradeType, mcxExposureType });
+            return res.status(500).json({
+                message: 'Internal Server Error',
+                error: 'Margin configuration missing exposureType'
+            });
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // EQUITY UNITS/LOTS MODE - Calculate actual_qty based on instrument type
+        // ═════════════════════════════════════════════════════════════
+        const qtyInput = qtyNum;
+        const lotSizeAtEntry = req.body.lot_size_at_entry || lotSize || 1;
+        const equityUnitsMode = req.body.equity_units_mode || 0;
+        const instrumentType = req.body.instrument_type || '';
+
+        let actualQty = qtyNum;
+        let tradeMode = 'LOTS';
+        // Get leverage from request body or client config (default 5x)
+        let leverageUsed = parseFloat(req.body.leverage_used) ||
+            parseFloat(clientConfig?.holding_leverage) || 5;
+
+        // Instrument Classification: NSE EQUITY vs Derivatives vs MCX
+        const isNseEquity = marketType === 'EQUITY' || (marketType === 'NSE' && instrumentType === 'EQ');
+        const isNseDerivative = (marketType === 'NSE' || marketType === 'NIFTY' || marketType === 'OPTIONS' || marketType === 'NFO') &&
+            ['FUT', 'CE', 'PE', 'OPT'].includes(instrumentType);
+        const isMcx = marketType === 'MCX';
+
+        console.log('[placeOrder] 📊 Equity Units Mode Calculation:', {
+            qtyInput,
+            exchange: marketType,
+            instrumentType,
+            isNseEquity,
+            isNseDerivative,
+            isMcx,
+            equityUnitsMode,
+            lotSizeAtEntry
+        });
+
+        // UNITS vs LOTS calculation
+        if (isNseEquity && equityUnitsMode === 1) {
+            // ✅ NSE EQUITY UNITS MODE: actual_qty = qty_input (1 unit = 1 share)
+            actualQty = qtyInput;
+            tradeMode = 'UNITS';
+            console.log(`[placeOrder] ✅ NSE EQUITY UNITS MODE: ${qtyInput} units = ${actualQty} shares`);
+        }
+        else if (isNseEquity && equityUnitsMode === 0) {
+            // ✅ NSE EQUITY LOTS MODE: actual_qty = qty_input × lot_size
+            actualQty = qtyInput * lotSizeAtEntry;
+            tradeMode = 'LOTS';
+            console.log(`[placeOrder] ✅ NSE EQUITY LOTS MODE: ${qtyInput} lots × ${lotSizeAtEntry} = ${actualQty} shares`);
+        }
+        else if (isNseDerivative) {
+            // ✅ NSE DERIVATIVES (FUT, CE, PE): ALWAYS LOTS, ignore units mode
+            actualQty = qtyInput * lotSizeAtEntry;
+            tradeMode = 'LOTS';
+            console.log(`[placeOrder] ✅ NSE DERIVATIVE (${instrumentType}): ${qtyInput} lots × ${lotSizeAtEntry} = ${actualQty}`);
+        }
+        else if (isMcx) {
+            // ✅ MCX: actual_qty = qty_input × lot_size (standard lot-based calculation)
+            actualQty = qtyInput * lotSizeAtEntry;
+            tradeMode = 'LOTS';
+            console.log(`[placeOrder] ✅ MCX LOTS MODE: ${qtyInput} lots × ${lotSizeAtEntry} = ${actualQty}`);
+        }
+
+        // --- Segment-specific Margin Calculation Logic ---
+        let newMarginRequired = 0;
+        const finalTurnover = executionPrice * actualQty;
+
+        if (isNseEquity || isNseDerivative) {
+            // NSE/NFO: Exposure-based (Turnover / Divisor)
+            const leverage = tradeType === 'HOLDING'
+                ? parseFloat(clientConfig?.equityHoldingMargin || 100)
+                : parseFloat(clientConfig?.equityIntradayMargin || 500);
+
+            newMarginRequired = finalTurnover / (leverage || 1);
+            leverageUsed = leverage;
+            console.log(`[placeOrder] 🏦 NSE/NFO Margin: ${finalTurnover} / ${leverage} = ${newMarginRequired}`);
+        } else {
+            // Default/MCX: Use MarginService (supports Per Lot Basis)
+            try {
+                newMarginRequired = MarginService.calculateRequiredMargin({
+                    qty: qtyInput,
+                    price: executionPrice,
+                    marginConfig,
+                    tradeType,
+                    lotSize: lotSizeAtEntry
+                });
+            } catch (innerMarginErr) {
+                console.warn(`[placeOrder] Inner MarginService error, falling back to Tier 1 marginRequired: ${innerMarginErr.message}`);
+                newMarginRequired = parseFloat(marginRequired) || ((executionPrice * qtyInput * lotSizeAtEntry) / 500);
+            }
+            // Back-calculate leverage for logging
+            leverageUsed = finalTurnover / (newMarginRequired || 1);
+            console.log(`[placeOrder] 🪙 MCX/Other Margin: ${newMarginRequired} (approx leverage: ${leverageUsed.toFixed(1)}x)`);
+        }
+        // --------------------------------------------------
+
+        console.log('[placeOrder] 📊 Final Trade Values:', {
+            qtyInput,
+            actualQty,
+            tradeMode,
+            turnover: finalTurnover,
+            leverage: leverageUsed,
+            margin: newMarginRequired.toFixed(2)
+        });
+
+        // ─── MARGIN VALIDATION ─────────────────────────────────────────────
+        // Fetch current margin used by all OPEN trades (non-pending)
+        const [[{ totalUsedMargin }]] = await db.execute(
+            "SELECT COALESCE(SUM(margin_used), 0) as totalUsedMargin FROM trades WHERE user_id = ? AND status = 'OPEN' AND is_pending = 0",
+            [targetUserId]
+        );
+
+        const availableMargin = parseFloat(targetUser.balance) - parseFloat(totalUsedMargin);
+
+        console.log('[placeOrder] 💰 Margin Check:', {
+            ledgerBalance: targetUser.balance,
+            totalUsedMargin,
+            availableMargin,
+            requiredForThisTrade: newMarginRequired
+        });
+
+        if (availableMargin < newMarginRequired) {
+            return res.status(400).json({
+                message: `Insufficient margin. Required: ₹${newMarginRequired.toFixed(2)}, Available: ₹${availableMargin.toFixed(2)}`,
+                required: newMarginRequired.toFixed(2),
+                available: availableMargin.toFixed(2),
+                shortfall: (newMarginRequired - availableMargin).toFixed(2)
+            });
+        }
+        // ───────────────────────────────────────────────────────────────────
+
+        const [result] = await db.execute(
+            `INSERT INTO trades
+                (user_id, symbol, type, order_type, qty, entry_price, exit_price, margin_used, is_pending, market_type, status, trade_ip, created_by, trade_type, margin_type,
+                 qty_input, actual_qty, lot_size_at_entry, trade_mode, turnover, leverage_used, equity_units_mode, entry_time)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [
+                targetUserId,
+                sym,
+                type.toUpperCase(),
+                order_type,
+                (isNseEquity || isNseDerivative) ? actualQty : qtyInput, // Store total units for NSE/NFO, keep lots for MCX
+                executionPrice,
+                exit_price ? parseFloat(exit_price) : null,
+                newMarginRequired.toFixed(2),
+                is_pending ? 1 : 0,
+                marketType,
+                'OPEN',
+                tradeIp,
+                requesterId,
+                tradeType,
+                marginConfig.exposureType,
+                qtyInput,
+                actualQty,
+                lotSizeAtEntry,
+                tradeMode,
+                finalTurnover.toFixed(2),
+                leverageUsed,
+                equityUnitsMode
+            ]
+        );
+
+        // 8. Check Balance but Don't Deduct
+        // (Ledger remains unchanged - margin calculation only for reference)
+        console.log(`[placeOrder] ℹ️ Margin Calculated (NEW FORMULA - Turnover/Leverage): ${newMarginRequired.toFixed(2)}`);
+        console.log(`[placeOrder] ℹ️ Ledger Balance: ${targetUser.balance} (unchanged)`);
+
+        console.log('✅ Trade Inserted:', result.insertId);
+        res.status(201).json({
+            message: 'Order placed successfully',
+            tradeId: result.insertId,
+            executionPrice,
+            marginUsed: newMarginRequired.toFixed(2),
+            qtyInput,
+            actualQty,
+            tradeMode,
+            turnover: finalTurnover.toFixed(2),
+            leverage: leverageUsed,
+            equityUnitsMode
+        });
+
+        // Log the trade placement with new fields
+        await logAction(requesterId, 'PLACE_ORDER', 'trades',
+            `Placed ${type.toUpperCase()} order for ${sym} (Qty Input: ${qtyInput}, Actual Qty: ${actualQty}, Mode: ${tradeMode}, Price: ${executionPrice}) for user #${targetUserId}`);
+
+
+    } catch (err) {
+        console.error('❌ Trade Placement Error:', err);
+        res.status(500).json({ message: 'Internal Server Error', error: err.message });
+    }
+};
+
+/**
+ * Get Trades by Status (Active, Closed, Deleted)
+ */
+const getTrades = async (req, res) => {
+    const { status, user_id } = req.query; // OPEN, CLOSED, DELETED, CANCELLED
+    try {
+        let query = 'SELECT t.*, u.username FROM trades t JOIN users u ON t.user_id = u.id WHERE 1=1';
+        const params = [];
+
+        if (status) {
+            query += ' AND t.status = ?';
+            params.push(status);
+        }
+
+        if (req.query.is_pending !== undefined) {
+            const isPending = req.query.is_pending === 'true' || req.query.is_pending === '1' ? 1 : 0;
+            query += ' AND t.is_pending = ?';
+            params.push(isPending);
+            // Pending orders list should only show active (OPEN) ones, not cancelled
+            if (isPending === 1 && !status) {
+                query += " AND t.status = 'OPEN'";
+            }
+        }
+
+        // Filter by specific user_id (for client detail views)
+        if (user_id) {
+            query += ' AND t.user_id = ?';
+            params.push(user_id);
+
+            // Role-based visibility logic: "Jisme jo trade banai usko vahi dikhe"
+            // ENHANCED: Admins/Brokers can also see trades of their direct subordinates
+            if (req.user.role !== 'TRADER') {
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u.id FROM users u 
+                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                    WHERE u.parent_id = ? OR cs.broker_id = ?
+                ))`;
+                params.push(req.user.id, req.user.id, req.user.id);
+            }
+        } else {
+            // Role-based visibility logic for global list
+            if (req.user.role === 'SUPERADMIN') {
+                // Superadmins see trades they created OR trades of their direct children/clients
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u.id FROM users u 
+                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                    WHERE u.parent_id = ? OR cs.broker_id = ?
+                ))`;
+                params.push(req.user.id, req.user.id, req.user.id);
+            } else if (req.user.role === 'ADMIN') {
+                // Admins see their own created trades OR trades of their descendants
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u.id FROM users u 
+                    LEFT JOIN client_settings cs ON u.id = cs.user_id
+                    WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+                ))`;
+                params.push(req.user.id, req.user.id, req.user.id);
+            } else if (req.user.role === 'BROKER') {
+                // Brokers see trades they created OR trades of their clients/sub-brokers
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u.id FROM users u 
+                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                    WHERE u.parent_id = ? OR cs.broker_id = ?
+                ))`;
+                params.push(req.user.id, req.user.id, req.user.id);
+            } else {
+                // TRADER see only their own (already handled in initial if, but safety fallback)
+                query += ' AND t.user_id = ?';
+                params.push(req.user.id);
+            }
+        }
+
+        // Filter by username
+        if (req.query.username) {
+            query += ' AND u.username LIKE ?';
+            params.push(`%${req.query.username}%`);
+        }
+
+        // Filter by scrip (symbol)
+        if (req.query.scrip) {
+            query += ' AND t.symbol LIKE ?';
+            params.push(`%${req.query.scrip}%`);
+        }
+
+        // Filter by date range
+        if (req.query.fromDate) {
+            query += ' AND DATE(t.entry_time) >= ?';
+            params.push(req.query.fromDate);
+        }
+        if (req.query.toDate) {
+            query += ' AND DATE(t.entry_time) <= ?';
+            params.push(req.query.toDate);
+        }
+
+        const [rows] = await db.execute(query, params);
+
+        // --- ENHANCEMENT: Dynamic Margin for OPEN trades ---
+        // If we are listing OPEN trades, we should calculate the current "Holding Margin Required"
+        // to match the app's Portfolio display.
+        if (status === 'OPEN' || !status) {
+            // Group by user to fetch configs once
+            const userIds = [...new Set(rows.map(r => r.user_id))];
+            if (userIds.length > 0) {
+                const [configRows] = await db.query(
+                    'SELECT user_id, config_json FROM client_settings WHERE user_id IN (?)',
+                    [userIds]
+                );
+                const configMap = {};
+                configRows.forEach(c => { configMap[c.user_id] = JSON.parse(c.config_json || '{}'); });
+
+                // ❌ REMOVED: Don't recalculate margin_used - use the value stored in database
+                // The margin_used is already correctly calculated and stored when trade is placed
+                // Recalculating it here overwrites INTRADAY margin with HOLDING margin calculation
+            }
+        }
+
+
+        res.json(rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Server Error');
+    }
+};
+
+/**
+ * Get Single Trade by ID
+ */
+const getTradeById = async (req, res) => {
+    try {
+        const [rows] = await db.execute(
+            `SELECT t.*, u.username, u.full_name
+             FROM trades t
+             JOIN users u ON t.user_id = u.id
+             WHERE t.id = ?`,
+            [req.params.id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Trade not found' });
+        }
+
+        const trade = rows[0];
+        const { id: requesterId } = req.user;
+
+        // Access check: "Jisme jo trade banai usko vahi dikhe"
+        // ENHANCED: Also allow Admin/Broker to see if it's their subordinate's trade
+        const isTargetUser = trade.user_id === requesterId;
+        const isCreator = trade.created_by === requesterId;
+
+        let isParent = false;
+        if (!isTargetUser && !isCreator) {
+            // Check if requester is parent or broker
+            const [relRows] = await db.execute(
+                `SELECT u.id FROM users u 
+                 LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                 WHERE u.id = ? AND (u.parent_id = ? OR cs.broker_id = ?)`,
+                [trade.user_id, requesterId, requesterId]
+            );
+            isParent = relRows.length > 0;
+        }
+
+        if (!isTargetUser && !isCreator && !isParent) {
+            return res.status(403).json({ message: 'Not authorized to view this trade' });
+        }
+
+        res.json(trade);
+    } catch (err) {
+        console.error('Get Trade by ID Error:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+const getGroupTrades = async (req, res) => {
+    try {
+        const { id, role } = req.user;
+        const { scrip, segment, fromDate, toDate } = req.query;
+
+        let query = `
+            SELECT
+                t.symbol,
+                t.type,
+                t.market_type,
+                SUM(COALESCE(t.actual_qty, t.qty)) as total_qty,
+                AVG(t.entry_price) as avg_price,
+                COUNT(*) as trade_count
+            FROM trades t
+            JOIN users u ON t.user_id = u.id
+            WHERE t.status = 'OPEN'
+        `;
+        const params = [];
+
+        // Hierarchy Isolation: "Jisme jo trade banai usko vahi dikhe"
+        if (role === 'TRADER') {
+            query += ` AND t.user_id = ?`;
+            params.push(id);
+        } else if (role === 'SUPERADMIN') {
+            // Superadmin sees groups for all users
+            console.log('[getGroupTrades] SUPERADMIN viewing all groups');
+        } else if (role === 'ADMIN') {
+            // Admin sees their groups OR their descendants' groups
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u 
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+            ))`;
+            params.push(id, id, id);
+        } else if (role === 'BROKER') {
+            // Broker sees their own created groups OR their clients' groups
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u 
+                LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                WHERE u.parent_id = ? OR cs.broker_id = ?
+            ))`;
+            params.push(id, id, id);
+        }
+        // Note: Joining users table is kept if needed for future filters, 
+        // though currently we filter by trade.user_id/created_by directly where possible.
+
+        // Filter by scrip (symbol)
+        if (scrip) {
+            query += ` AND t.symbol LIKE ?`;
+            params.push(`%${scrip}%`);
+        }
+
+        // Filter by segment (market type)
+        if (segment && segment !== 'All') {
+            query += ` AND t.market_type = ?`;
+            params.push(segment);
+        }
+
+        // Filter by date range
+        if (fromDate) {
+            query += ` AND DATE(t.entry_time) >= ?`;
+            params.push(fromDate);
+        }
+        if (toDate) {
+            query += ` AND DATE(t.entry_time) <= ?`;
+            params.push(toDate);
+        }
+
+        query += ` GROUP BY t.symbol, t.type, t.market_type ORDER BY t.symbol ASC`;
+
+        const [rows] = await db.execute(query, params);
+        res.json(rows);
+    } catch (err) {
+
+        console.error(err);
+        res.status(500).send('Server Error');
+    }
+};
+
+const tradeService = require('../services/TradeService');
+
+/**
+ * Close/Square-off Trade
+ * - Pending orders (is_pending=1): cancelled immediately, margin refunded, no PnL
+ * - Open orders: closed at exitPrice or current market price
+ */
+const closeTrade = async (req, res) => {
+    try {
+        const { exitPrice, pnl } = req.body;
+        const requesterId = req.user.id;
+
+        // 1. Initial Fetch to check feasibility
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [req.params.id]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+        if (trade.status !== 'OPEN') {
+            return res.status(400).json({ message: 'Trade is already closed or inactive' });
+        }
+
+        // ─── VALIDATIONS (Min Time / Scalping SL) ─────────────────────────
+        const [clientSettings] = await db.execute(
+            'SELECT config_json FROM client_settings WHERE user_id = ?',
+            [trade.user_id]
+        );
+        const clientConfig = clientSettings.length > 0 ? JSON.parse(clientSettings[0].config_json || '{}') : {};
+
+        let minTimeSeconds = 0;
+        if (trade.market_type === 'MCX') minTimeSeconds = parseInt(clientConfig.mcxMinTimeToBookProfit || 0);
+        else if (trade.market_type === 'EQUITY') minTimeSeconds = parseInt(clientConfig.equityMinTimeToBookProfit || 0);
+        else if (trade.market_type === 'OPTIONS') minTimeSeconds = parseInt(clientConfig.optionsMinTimeToBookProfit || 0);
+        else if (trade.market_type === 'CRYPTO') minTimeSeconds = parseInt((clientConfig.cryptoConfig || {}).minTimeToBookProfit || 0);
+        else if (trade.market_type === 'FOREX') minTimeSeconds = parseInt((clientConfig.forexConfig || {}).minTimeToBookProfit || 0);
+        else if (trade.market_type === 'COMEX') minTimeSeconds = parseInt((clientConfig.comexConfig || {}).minTimeToBookProfit || 0);
+
+        const entryTime = new Date(trade.entry_time);
+        const now = new Date();
+        const secondsHeld = Math.floor((now - entryTime) / 1000);
+        const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
+        const lotSize = (scripRows.length > 0) ? parseFloat(scripRows[0].lot_size || 1) : 1;
+
+        const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
+        const marketTypeForClose = (trade.market_type || 'MCX').toUpperCase();
+        const prefixForClose = marketTypeForClose === 'EQUITY' ? 'NSE' : (marketTypeForClose === 'OPTIONS' ? 'NFO' : marketTypeForClose);
+
+        let livePriceForClose = null;
+        const possibleSymbolsForClose = [trade.symbol, `${prefixForClose}:${cleanSymbol}`, cleanSymbol];
+        const marketDataService = require('../services/MarketDataService');
+        for (const s of possibleSymbolsForClose) {
+            const data = marketDataService.getPrice(s);
+            if (data && data.ltp) {
+                livePriceForClose = data.ltp;
+                break;
+            }
+        }
+
+        const currentPrice = exitPrice || livePriceForClose || trade.entry_price;
+        const actualQuantity = trade.actual_qty || (trade.qty * lotSize);
+        const validationPnl = trade.type === 'BUY'
+            ? (currentPrice - trade.entry_price) * actualQuantity
+            : (trade.entry_price - currentPrice) * actualQuantity;
+
+        if (minTimeSeconds > 0 && secondsHeld < minTimeSeconds) {
+            return res.status(400).json({
+                message: `Minimum hold time is ${minTimeSeconds} seconds. Please wait ${minTimeSeconds - secondsHeld} more second(s).`,
+                remainingSeconds: minTimeSeconds - secondsHeld
+            });
+        }
+
+        // ─── EXECUTE CLOSURE VIA SERVICE ──────────────────────────────────
+        const result = await tradeService.closeTrade(trade.id, exitPrice, requesterId, pnl);
+
+        res.json({
+            message: 'Trade closed successfully',
+            ...result
+        });
+    } catch (err) {
+        console.error('❌ Close Trade Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
+/**
+ * Soft Delete Trade (Audit Trail) — refunds margin + PnL back to user
+ */
+const deleteTrade = async (req, res) => {
+    try {
+        // Verify transaction password if provided (Bypass for TRADER)
+        if (req.user.role !== 'TRADER' && req.body && req.body.transactionPassword) {
+            const [users] = await db.execute('SELECT transaction_password FROM users WHERE id = ?', [req.user.id]);
+            if (users.length && users[0].transaction_password) {
+                const match = await bcrypt.compare(req.body.transactionPassword, users[0].transaction_password);
+                if (!match) return res.status(403).json({ message: 'Invalid transaction password' });
+            }
+        }
+
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [req.params.id]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+        if (trade.status === 'DELETED') return res.status(400).json({ message: 'Trade already deleted' });
+
+        // Refund: margin + PnL (for CLOSED trades) or just margin (for OPEN trades)
+        const marginToRefund = parseFloat(trade.margin_used || 0);
+        const pnlToRefund = trade.status === 'CLOSED' ? parseFloat(trade.pnl || 0) : 0;
+        const balanceRefund = marginToRefund + pnlToRefund;
+
+        await db.execute('UPDATE trades SET status = "DELETED", exit_time = NOW() WHERE id = ?', [req.params.id]);
+
+        if (balanceRefund !== 0) {
+            await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [balanceRefund, trade.user_id]);
+        }
+
+        await logAction(req.user.id, 'DELETE_TRADE', 'trades', `Deleted trade #${req.params.id}. Refunded margin: ${marginToRefund}, PnL: ${pnlToRefund}`);
+
+        // Clear cache on trade delete (Option A)
+        try {
+            await invalidateCache(`m2m_${trade.user_id}_TRADER`);
+            await invalidateCache(`m2m_${trade.user_id}_SUPERADMIN`);
+        } catch (e) {
+            console.log(`[Cache] Clear failed but trade deleted`);
+        }
+
+        res.json({ message: 'Trade deleted and refunded', marginRefunded: marginToRefund, pnlRefunded: pnlToRefund });
+    } catch (err) {
+        console.error('Delete Trade Error:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+/**
+ * Update Trade (modify entry_price, exit_price, qty)
+ */
+const updateTrade = async (req, res) => {
+    try {
+        const { entry_price, exit_price, qty, transactionPassword } = req.body;
+
+        // Verify transaction password (Bypass for TRADER)
+        if (req.user.role !== 'TRADER' && transactionPassword) {
+            const [users] = await db.execute('SELECT transaction_password FROM users WHERE id = ?', [req.user.id]);
+            if (users.length && users[0].transaction_password) {
+                const match = await bcrypt.compare(transactionPassword, users[0].transaction_password);
+                if (!match) return res.status(403).json({ message: 'Invalid transaction password' });
+            }
+        }
+
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [req.params.id]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+
+        // Build dynamic update
+        const updates = [];
+        const params = [];
+
+        if (qty !== undefined && qty !== '' && qty !== null) {
+            const newQty = parseInt(qty);
+            if (newQty <= 0) return res.status(400).json({ message: 'Quantity must be positive' });
+            updates.push('qty = ?');
+            params.push(newQty);
+
+            // Recalculate margin: price * qty * lotSize * 0.1
+            let lotSize = 1;
+            try {
+                const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
+                if (scripRows.length > 0 && parseFloat(scripRows[0].lot_size) > 1) {
+                    lotSize = parseFloat(scripRows[0].lot_size);
+                } else if ((trade.market_type || '').toUpperCase() === 'MCX') {
+                    const MarginUtils = require('../utils/MarginUtils');
+                    const baseScrip = MarginUtils.getMcxBaseScrip(trade.symbol);
+                    const MCX_LOT_SIZES = {
+                        'GOLD': 100, 'GOLDM': 10, 'GOLDGUINEA': 8, 'GOLDPETAL': 1,
+                        'SILVER': 30, 'SILVERM': 5, 'SILVERMIC': 1,
+                        'CRUDEOIL': 100, 'CRUDEOILM': 10,
+                        'NATURALGAS': 1250, 'NATGASMINI': 250,
+                        'COPPER': 2500,
+                        'ZINC': 5000, 'ZINCMINI': 1000,
+                        'LEAD': 5000, 'LEADMINI': 1000,
+                        'NICKEL': 1500, 'NICKELMINI': 100,
+                        'ALUMINIUM': 5000, 'ALUMINI': 1000,
+                        'MENTHAOIL': 360, 'COTTON': 25, 'BULLDEX': 1,
+                    };
+                    if (baseScrip && MCX_LOT_SIZES[baseScrip]) lotSize = MCX_LOT_SIZES[baseScrip];
+                }
+            } catch (e) { }
+
+            const price = entry_price ? parseFloat(entry_price) : parseFloat(trade.entry_price);
+            const newMargin = price * newQty * lotSize * 0.1;
+            const oldMargin = parseFloat(trade.margin_used || 0);
+            const marginDiff = newMargin - oldMargin;
+
+            updates.push('margin_used = ?');
+            params.push(newMargin);
+
+            // Adjust user balance for margin difference
+            if (marginDiff !== 0) {
+                await db.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [marginDiff, trade.user_id]);
+            }
+        }
+
+        if (entry_price !== undefined && entry_price !== '' && entry_price !== null) {
+            updates.push('entry_price = ?');
+            params.push(parseFloat(entry_price));
+        }
+
+        if (exit_price !== undefined && exit_price !== '' && exit_price !== null) {
+            updates.push('exit_price = ?');
+            params.push(parseFloat(exit_price));
+
+            // Recalculate PnL if both entry and exit price exist
+            const entryP = entry_price ? parseFloat(entry_price) : parseFloat(trade.entry_price);
+            const exitP = parseFloat(exit_price);
+            const q = qty ? parseInt(qty) : trade.qty;
+            const pnl = trade.type === 'BUY' ? (exitP - entryP) * q : (entryP - exitP) * q;
+            updates.push('pnl = ?');
+            params.push(pnl);
+        }
+
+        if (updates.length === 0) return res.status(400).json({ message: 'No fields to update' });
+
+        params.push(req.params.id);
+        await db.execute(`UPDATE trades SET ${updates.join(', ')} WHERE id = ?`, params);
+
+        await logAction(req.user.id, 'UPDATE_TRADE', 'trades', `Updated trade #${req.params.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);
+
+        res.json({ message: 'Trade updated successfully' });
+    } catch (err) {
+        console.error('Update Trade Error:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+/**
+ * Restore Trade — reopens a CLOSED trade by removing exit data
+ * Reverses the close: removes exit_price, exit_time, resets PnL, re-deducts margin from balance
+ */
+const restoreTrade = async (req, res) => {
+    try {
+        const { transactionPassword } = req.body;
+
+        // Verify transaction password (Bypass for TRADER)
+        if (req.user.role !== 'TRADER' && transactionPassword) {
+            const [users] = await db.execute('SELECT transaction_password FROM users WHERE id = ?', [req.user.id]);
+            if (users.length && users[0].transaction_password) {
+                const match = await bcrypt.compare(transactionPassword, users[0].transaction_password);
+                if (!match) return res.status(403).json({ message: 'Invalid transaction password' });
+            }
+        }
+
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [req.params.id]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+        if (trade.status !== 'CLOSED') {
+            return res.status(400).json({ message: 'Only CLOSED trades can be restored' });
+        }
+
+        // Reverse the close: take back PnL + margin that was released, then re-lock margin
+        const pnl = parseFloat(trade.pnl || 0);
+        const margin = parseFloat(trade.margin_used || 0);
+        // On close: balance += pnl + margin. To reverse: balance -= (pnl + margin) then balance += 0 (margin stays locked)
+        // Net: balance -= pnl (refund the PnL reversal, keep margin locked)
+        const balanceDeduction = pnl; // Remove the PnL that was credited on close
+
+        // Reopen the trade
+        await db.execute(
+            'UPDATE trades SET status = "OPEN", exit_price = NULL, exit_time = NULL, pnl = 0 WHERE id = ?',
+            [req.params.id]
+        );
+
+        // Reverse balance: deduct the PnL that was added on close
+        if (balanceDeduction !== 0) {
+            await db.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [balanceDeduction, trade.user_id]);
+        }
+
+        await logAction(req.user.id, 'RESTORE_TRADE', 'trades', `Restored trade #${req.params.id} to OPEN. PnL reversed: ${pnl}`);
+
+        res.json({ message: 'Trade restored to OPEN', pnlReversed: pnl });
+    } catch (err) {
+        console.error('Restore Trade Error:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+/**
+ * Modify Pending Order — trader can modify their own pending orders (qty, price)
+ */
+const modifyPendingOrder = async (req, res) => {
+    try {
+        const { qty, price } = req.body;
+        const tradeId = req.params.id;
+        const userId = req.user.id;
+
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [tradeId]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+
+        // Trader can only modify their own orders
+        if (trade.user_id !== userId) {
+            return res.status(403).json({ message: 'Not authorized to modify this order' });
+        }
+
+        // Only pending orders can be modified
+        if (trade.status !== 'PENDING' && trade.is_pending !== 1) {
+            return res.status(400).json({ message: 'Only pending orders can be modified' });
+        }
+
+        const updates = [];
+        const params = [];
+
+        if (qty !== undefined && qty !== null) {
+            let qtyToStore = parseInt(qty);
+
+            // ✅ FOR MCX: Multiply by LOT size to get actual units
+            if (trade.market_type === 'MCX') {
+                try {
+                    const MCX_LOT_SIZES = {
+                        'GOLD': 100, 'GOLDM': 10, 'GOLDGUINEA': 8, 'GOLDPETAL': 1,
+                        'SILVER': 30, 'SILVERM': 5, 'SILVERMIC': 1,
+                        'CRUDEOIL': 100, 'CRUDEOILM': 10,
+                        'COPPER': 250, 'COPPERMIC': 1, 'NICKEL': 250, 'NICKELMINI': 10,
+                        'ZINC': 250, 'ZINCY': 250, 'LEAD': 250, 'LEADMINI': 10,
+                        'ALUMINIUM': 1000, 'ALUMINI': 1000, 'NATURALGAS': 1250,
+                        'MENTHAOIL': 360, 'COTTON': 100, 'BULLDEX': 100, 'CRUDEOIL MINI': 10
+                    };
+
+                    const [configRows] = await db.execute('SELECT config_json FROM client_settings WHERE user_id = ?', [trade.user_id]);
+                    let lotSize = 1;
+
+                    if (configRows.length > 0) {
+                        const clientConfig = JSON.parse(configRows[0].config_json || '{}');
+                        const baseSym = getMcxBaseScrip(trade.symbol) || trade.symbol.toUpperCase();
+                        lotSize = parseFloat(clientConfig?.mcxLotMargins?.[baseSym]?.LOT || 1);
+                    }
+
+                    if (!lotSize || lotSize <= 1) {
+                        const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
+                        if (scripRows.length > 0) {
+                            lotSize = parseFloat(scripRows[0].lot_size || 1);
+                        } else {
+                            const baseSym = getMcxBaseScrip(trade.symbol);
+                            if (baseSym && MCX_LOT_SIZES[baseSym]) {
+                                lotSize = MCX_LOT_SIZES[baseSym];
+                            }
+                        }
+                    }
+
+                    // Store quantity as entered by user (no lot multiplication)
+                    qtyToStore = parseInt(qty);
+                } catch (e) {
+                    console.warn('[modifyPendingOrder] Warning: Could not fetch lotSize, using qty as-is:', e.message);
+                }
+            }
+
+            updates.push('qty = ?');
+            params.push(qtyToStore);
+        }
+        if (price !== undefined && price !== null) {
+            updates.push('entry_price = ?');
+            params.push(parseFloat(price));
+        }
+
+        if (updates.length === 0) {
+            return res.status(400).json({ message: 'Nothing to update' });
+        }
+
+        params.push(tradeId);
+        await db.execute(`UPDATE trades SET ${updates.join(', ')} WHERE id = ?`, params);
+
+        res.json({ message: 'Pending order modified successfully' });
+    } catch (err) {
+        console.error('Modify Pending Order Error:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+/**
+ * Set Target & Stop Loss for a trade
+ * Called from mobile app when user sets target/SL
+ */
+const setTargetSL = async (req, res) => {
+    try {
+        const tradeId = req.params.id;
+        const { targetPrice, stopLoss } = req.body;
+        const userId = req.user?.id;
+
+        if (!userId) {
+            return res.status(401).json({ message: 'Unauthorized: User not found in request' });
+        }
+
+        // Fetch trade to verify ownership
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [tradeId]);
+        if (trades.length === 0) {
+            return res.status(404).json({ message: 'Trade not found' });
+        }
+
+        const trade = trades[0];
+
+        // Authorization check
+        if (trade.user_id !== userId && req.user.role === 'TRADER') {
+            return res.status(403).json({ message: 'Not authorized to modify this trade' });
+        }
+
+        // Only open trades can have target/SL set
+        if (trade.status !== 'OPEN') {
+            return res.status(400).json({ message: 'Trade is not open' });
+        }
+
+        // Validate prices - convert NaN to null for database binding
+        let target = null;
+        let sl = null;
+
+        if (targetPrice) {
+            const parsed = parseFloat(targetPrice);
+            target = isNaN(parsed) ? null : parsed;
+        }
+
+        if (stopLoss) {
+            const parsed = parseFloat(stopLoss);
+            sl = isNaN(parsed) ? null : parsed;
+        }
+
+        if (target && sl) {
+            if (trade.type === 'BUY' && target <= sl) {
+                return res.status(400).json({ message: 'For BUY trades: Target must be > Stop Loss' });
+            }
+            if (trade.type === 'SELL' && target >= sl) {
+                return res.status(400).json({ message: 'For SELL trades: Target must be < Stop Loss' });
+            }
+        }
+
+        // Validate all parameters before database update
+        console.log(`[TargetSL] DEBUG - tradeId: ${tradeId}, target: ${target}, sl: ${sl}`);
+        console.log(`[TargetSL] DEBUG - Types - tradeId: ${typeof tradeId}, target: ${typeof target}, sl: ${typeof sl}`);
+
+        if (tradeId === undefined || tradeId === null) {
+            return res.status(400).json({ message: 'Trade ID is required' });
+        }
+
+        // Update trade with target & SL
+        await db.execute(
+            'UPDATE trades SET target_price = ?, stop_loss = ? WHERE id = ?',
+            [target, sl, tradeId]
+        );
+
+        console.log(`[TargetSL] ✅ Trade #${tradeId} updated - Target: ${target}, SL: ${sl}`);
+
+        res.json({
+            message: 'Target & Stop Loss set successfully',
+            targetPrice: target,
+            stopLoss: sl
+        });
+    } catch (err) {
+        console.error('❌ Set Target/SL Error:', err.message || err);
+        res.status(500).json({ message: `Failed to set Target/SL: ${err.message || 'Unknown error'}` });
+    }
+};
+
+module.exports = { placeOrder, getTrades, getTradeById, getGroupTrades, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL };

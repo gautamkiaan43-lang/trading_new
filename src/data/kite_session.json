@@ -1,0 +1,37 @@
+{
+  "user_type": "individual/res_no_nn",
+  "email": "ashish.jha382@gmail.com",
+  "user_name": "Ashish Jha",
+  "user_shortname": "Ashish",
+  "broker": "ZERODHA",
+  "exchanges": [
+    "MF",
+    "BSE",
+    "NSE"
+  ],
+  "products": [
+    "CNC",
+    "NRML",
+    "MIS",
+    "BO",
+    "CO"
+  ],
+  "order_types": [
+    "MARKET",
+    "LIMIT",
+    "SL",
+    "SL-M"
+  ],
+  "avatar_url": null,
+  "user_id": "EHY834",
+  "api_key": "wk26e1mko3hz1biw",
+  "access_token": "r1k1HfwQmalJqHsWqFrPXiRpnzCd3CcO",
+  "public_token": "NQF3PXo4t8vfN4aQpiCg7oa80tFQodTr",
+  "refresh_token": "",
+  "enctoken": "nZDcWzPyegxaB8ocUXSwf4ycp/WW2bsRmMMALWCJbalDcXvjv+7kvWcHfBy39DvqKd10P4lyPIdqav8McRKvdaLAmoq4r/e1eIgahwvuoCXzGd7s3iRLo5U6uXSW4oU=",
+  "login_time": "2026-05-14 12:39:34",
+  "meta": {
+    "demat_consent": "consent"
+  },
+  "saved_at": "2026-05-14T07:09:43.176Z"
+}
