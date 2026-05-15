@@ -120,8 +120,8 @@ class TradeService {
                 }
 
                 if (liveData) {
-                    finalExitPrice = trade.type === 'BUY' ? (liveData.bid || liveData.ltp) : (liveData.ask || liveData.ltp);
-                    console.log(`[TradeService] Found in Ticker: ${finalExitPrice} (${trade.type === 'BUY' ? 'BID' : 'ASK'})`);
+                    finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
+                    console.log(`[TradeService] Found in Ticker (LTP Priority): ${finalExitPrice}`);
                 }
 
                 // 🎯 2. Fallback to Kite API (Full Quote)
@@ -132,10 +132,8 @@ class TradeService {
                         const quoteRes = await kiteService.getQuote(kiteSym);
                         const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
                         if (quote) {
-                            finalExitPrice = trade.type === 'BUY'
-                                ? (quote.depth?.buy?.[0]?.price || quote.last_price)
-                                : (quote.depth?.sell?.[0]?.price || quote.last_price);
-                            console.log(`[TradeService] Kite Quote Received: ${finalExitPrice}`);
+                            finalExitPrice = quote.last_price || (trade.type === 'BUY' ? quote.depth?.buy?.[0]?.price : quote.depth?.sell?.[0]?.price);
+                            console.log(`[TradeService] Kite Quote Received (LTP Priority): ${finalExitPrice}`);
                         }
                     } catch (e) {
                         console.error(`[TradeService] Kite Quote Error:`, e.message);
