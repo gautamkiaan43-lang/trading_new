@@ -55,46 +55,53 @@ class TradeService {
             const mType = (trade.market_type || '').toUpperCase();
 
             // ══════════════════════════════════════════════════════════════════
-            // MCX LOT SIZE (100% Complete - DO NOT MODIFY)
+            // LOT SIZE CALCULATION (Sync with dashboardController.js)
             // ══════════════════════════════════════════════════════════════════
             if (mType === 'MCX') {
-                lotSize = getLotSize(trade.symbol, 'MCX');
-                console.log(`[TradeService] MCX Lot Size: ${trade.symbol} → ${lotSize}`);
-            }
-            // ══════════════════════════════════════════════════════════════════
-            // EQUITY (NSE) LOT SIZE
-            // ══════════════════════════════════════════════════════════════════
-            else if (mType === 'EQUITY') {
-                try {
-                    // Try to get from database first
-                    const [scripRows] = await connection.execute(
-                        'SELECT lot_size FROM scrip_data WHERE symbol = ?',
-                        [trade.symbol]
-                    );
-
-                    if (scripRows.length > 0) {
-                        lotSize = parseFloat(scripRows[0].lot_size) || 1;
-                        console.log(`[TradeService] EQUITY Lot Size (from DB): ${trade.symbol} → ${lotSize}`);
-                    } else {
-                        // Default: Equity lot size is always 1 (trading in individual shares)
-                        lotSize = 1;
-                        console.log(`[TradeService] EQUITY Lot Size (default): ${trade.symbol} → 1`);
+                const { getMcxBaseScrip, MCX_LOT_SIZES } = require('../utils/symbolHelper');
+                const base = getMcxBaseScrip(trade.symbol);
+                const symTrimmed = (trade.symbol || '').toUpperCase().replace(/\d+.*/, '');
+                
+                // 1. Try Hardcoded MCX_LOT_SIZES first (Primary source)
+                if (base && MCX_LOT_SIZES[base]) {
+                    lotSize = MCX_LOT_SIZES[base];
+                } else if (MCX_LOT_SIZES[symTrimmed]) {
+                    lotSize = MCX_LOT_SIZES[symTrimmed];
+                }
+                
+                // 2. Try User Specific Override from client_settings
+                if (clientConfig && typeof clientConfig === 'object' && clientConfig.mcxLotMargins) {
+                    const overrides = clientConfig.mcxLotMargins;
+                    const configLot = overrides[trade.symbol] || overrides[base] || overrides[symTrimmed];
+                    if (configLot && typeof configLot === 'object' && configLot.LOT) {
+                        const customLot = parseFloat(configLot.LOT);
+                        if (customLot > 0) {
+                            lotSize = customLot;
+                            console.log(`[TradeService] Using User-Specific MCX Lot Size: ${lotSize}`);
+                        }
                     }
-                } catch (e) {
-                    lotSize = 1;
-                    console.error(`[TradeService] Error fetching EQUITY lot size:`, e.message);
+                }
+                console.log(`[TradeService] Final MCX Lot Size: ${trade.symbol} → ${lotSize}`);
+            }
+            else if (mType === 'EQUITY' || mType === 'NSE' || mType === 'NFO' || mType === 'OPTIONS') {
+                // NSE/Equity generally uses 1 share = 1 unit for P/L calculation, 
+                // unless it's a derivative where we might need to check DB for lot_size.
+                lotSize = 1; 
+                if (mType !== 'EQUITY') {
+                    try {
+                        const [scripRows] = await connection.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
+                        if (scripRows.length > 0) lotSize = parseFloat(scripRows[0].lot_size) || 1;
+                    } catch (e) { console.warn(`[TradeService] Error fetching ${mType} lot size:`, e.message); }
                 }
             }
-            // ══════════════════════════════════════════════════════════════════
-            // OTHER SEGMENTS (NFO, OPTIONS, etc.)
-            // ══════════════════════════════════════════════════════════════════
             else {
+                // Default fallback to scrip_data
                 try {
                     const [scripRows] = await connection.execute(
                         'SELECT lot_size FROM scrip_data WHERE symbol = ?',
                         [trade.symbol]
                     );
-                    if (scripRows.length > 0 && parseFloat(scripRows[0].lot_size) > 1) {
+                    if (scripRows.length > 0 && parseFloat(scripRows[0].lot_size) > 0) {
                         lotSize = parseFloat(scripRows[0].lot_size);
                         console.log(`[TradeService] ${mType} Lot Size (from DB): ${trade.symbol} → ${lotSize}`);
                     } else {
@@ -115,22 +122,37 @@ class TradeService {
                 // 🎯 1. For Indian Segments, try Kite API (Direct Quote) FIRST for accuracy
                 if (isIndianSegment && kiteService.isAuthenticated()) {
                     try {
-                        const kiteSym = trade.symbol.includes(':') ? trade.symbol : (mType === 'MCX' ? `MCX:${trade.symbol}` : (mType === 'EQUITY' ? `NSE:${trade.symbol}` : `NFO:${trade.symbol}`));
-                        console.log(`[TradeService] Fetching Real-time Kite Quote for ${kiteSym}...`);
-                        const quoteRes = await kiteService.getQuote(kiteSym);
-                        const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
-                        if (quote && quote.last_price > 0) {
-                            finalExitPrice = quote.last_price;
-                            console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice}`);
+                        const cleanSym = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
+                        const kitePatterns = [
+                            trade.symbol,
+                            `${mType === 'MCX' ? 'MCX' : (mType === 'EQUITY' ? 'NSE' : 'NFO')}:${cleanSym}`,
+                            `NSE:${cleanSym}`, `NFO:${cleanSym}`, `MCX:${cleanSym}`
+                        ];
+                        
+                        for (const kiteSym of kitePatterns) {
+                            console.log(`[TradeService] Fetching Real-time Kite Quote for ${kiteSym}...`);
+                            const quoteRes = await kiteService.getQuote(kiteSym);
+                            const quote = quoteRes[kiteSym];
+                            if (quote && quote.last_price > 0) {
+                                finalExitPrice = quote.last_price;
+                                console.log(`[TradeService] ✅ Real Zerodha Price Received (${kiteSym}): ${finalExitPrice}`);
+                                break;
+                            }
                         }
                     } catch (e) {
-                        console.warn(`[TradeService] Kite Quote Fallback triggered:`, e.message);
+                        console.warn(`[TradeService] Kite Quote search failed:`, e.message);
                     }
                 }
 
-                // 🎯 2. Try Memory Ticker (Primary for Forex/Crypto, Fallback for others)
+                // 🎯 2. Try Memory Ticker (Fallback or for Forex/Crypto)
                 if (!finalExitPrice || finalExitPrice <= 0) {
-                    const searchPatterns = [trade.symbol, `MCX:${trade.symbol}`, `NFO:${trade.symbol}`, `NSE:${trade.symbol}`, `FOREX:${trade.symbol}`, `CRYPTO:${trade.symbol}`];
+                    const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
+                    const searchPatterns = [
+                        trade.symbol,
+                        `MCX:${cleanSymbol}`, `NFO:${cleanSymbol}`, `NSE:${cleanSymbol}`,
+                        `CRYPTO:${cleanSymbol}`, `FOREX:${cleanSymbol}`, `COMEX:${cleanSymbol}`,
+                        cleanSymbol
+                    ];
                     let liveData = null;
                     for (const p of searchPatterns) {
                         liveData = marketDataService.getPrice(p);
@@ -139,7 +161,7 @@ class TradeService {
 
                     if (liveData) {
                         finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
-                        console.log(`[TradeService] Found in Ticker: ${finalExitPrice}`);
+                        console.log(`[TradeService] Found in Memory Ticker: ${finalExitPrice}`);
                     }
                 }
 
@@ -351,6 +373,7 @@ class TradeService {
             try {
                 await invalidateCache(`m2m_${trade.user_id}_TRADER`);
                 await invalidateCache(`m2m_${trade.user_id}_BROKER`);
+                await invalidateCache(`m2m_${trade.user_id}_SUPERADMIN`);
             } catch (_) { }
 
             return { success: true, pnl, brokerage, swap, balanceChange };

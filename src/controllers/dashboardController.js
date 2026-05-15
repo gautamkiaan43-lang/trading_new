@@ -355,6 +355,20 @@ const getClientLiveM2M = async (req, res) => {
                 }
 
                 clientMap[trade.user_id].margin += dynamicMargin;
+            } else if (trade.status === 'CLOSED') {
+                // ✅ FIXED: Only include realized PnL in the daily summary if it was closed TODAY
+                const today = new Date();
+                const todayStr = today.getFullYear() + '-' + (today.getMonth() + 1).toString().padStart(2, '0') + '-' + today.getDate().toString().padStart(2, '0');
+                
+                let exitDateStr = '';
+                if (trade.exit_time) {
+                    const ed = new Date(trade.exit_time);
+                    exitDateStr = ed.getFullYear() + '-' + (ed.getMonth() + 1).toString().padStart(2, '0') + '-' + ed.getDate().toString().padStart(2, '0');
+                }
+
+                if (exitDateStr === todayStr) {
+                    stats.profitLoss[segment] += parseFloat(trade.pnl || 0);
+                }
             }
         });
 
