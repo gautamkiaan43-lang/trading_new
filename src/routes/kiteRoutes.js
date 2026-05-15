@@ -1789,7 +1789,9 @@ router.get('/instruments/search', authMiddleware, asyncHandler(async (req, res) 
     const { q, exchange } = req.query;
     if (!q || q.length < 1) return res.json([]);
     const instruments = await getInstrumentsFromCache();
-    const query = q.toUpperCase();
+    
+    // BACKEND SEARCH LOGIC: Split by spaces and ensure every word is matched
+    const searchTokens = q.toUpperCase().split(/\s+/).filter(t => t.length > 0);
     
     // Fetch lot sizes from scrip_data for script-wise dynamic values without strict matching
     const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
@@ -1824,8 +1826,14 @@ router.get('/instruments/search', authMiddleware, asyncHandler(async (req, res) 
     };
 
     let results = instruments.filter(i => {
-        const matchesQuery = (i.tradingsymbol || '').toUpperCase().includes(query) ||
-                             (i.name || '').toUpperCase().includes(query);
+        const symbolClean = (i.tradingsymbol || '').toUpperCase();
+        const nameClean = (i.name || '').toUpperCase();
+        
+        // All parts of the search query must exist in the symbol or name
+        const matchesQuery = searchTokens.every(token => 
+            symbolClean.includes(token) || nameClean.includes(token)
+        );
+        
         const matchesExchange = !exchange || i.exchange === exchange;
         return matchesQuery && matchesExchange;
     }).slice(0, 100);

@@ -378,18 +378,53 @@ const placeOrder = async (req, res) => {
             console.log(`[placeOrder] ✅ Lot size valid: Min=${minLot}, Max=${maxLot}, Qty=${qtyNum}`);
 
             // ─── INSTRUMENT-SPECIFIC LOT SIZE VALIDATION ─────────────────────
-            // Check if qty exceeds the instrument's LOT value from mcxLotMargins
-            // Example: If GOLD has LOT=5, user can only place max 5 lots at a time
-            const baseSym = sym.toUpperCase();
-            const instrumentLotSize = parseInt(clientConfig?.mcxLotMargins?.[baseSym]?.LOT || 1);
+            // Fetch the base symbol (e.g., GOLD for GOLD26JUNFUT) to match with mcxLotMargins config
+            const baseSym = getMcxBaseScrip(symbol) || symbol.toUpperCase();
+            
+            // Get the configured LOT limit for this specific instrument. If not set, fallback to global MCX max lot
+            let instrumentLotSize = parseInt(clientConfig?.mcxLotMargins?.[baseSym]?.LOT);
+            if (isNaN(instrumentLotSize)) {
+                instrumentLotSize = maxLot; // Fallback to the global MCX maxLot if specific is not set
+            }
 
-            if (qtyNum > instrumentLotSize) {
+            // Check total lots currently held for this base symbol (e.g. all GOLD contracts)
+            const [openBaseTrades] = await db.execute(
+                `SELECT type, COALESCE(SUM(qty), 0) as total_qty 
+                 FROM trades 
+                 WHERE user_id = ? AND status = "OPEN" AND market_type = "MCX" AND symbol LIKE ?
+                 GROUP BY type`,
+                [targetUserId, `%${baseSym}%`]
+            );
+            
+            let currentOpenBuyQty = 0;
+            let currentOpenSellQty = 0;
+            for (const row of openBaseTrades) {
+                if (row.type === 'BUY') currentOpenBuyQty += parseInt(row.total_qty);
+                if (row.type === 'SELL') currentOpenSellQty += parseInt(row.total_qty);
+            }
+
+            const currentOpenQty = currentOpenBuyQty > 0 ? currentOpenBuyQty : currentOpenSellQty;
+            const openType = currentOpenBuyQty > 0 ? 'BUY' : (currentOpenSellQty > 0 ? 'SELL' : null);
+
+            let newTotalQty = qtyNum;
+            const orderTypeUpper = type.toUpperCase();
+            
+            if (openType === orderTypeUpper) {
+                // Adding to existing position
+                newTotalQty = currentOpenQty + qtyNum;
+            } else if (openType !== null) {
+                // Opposite order (squaring off or reversing)
+                // Resulting position will be absolute difference
+                newTotalQty = Math.max(0, qtyNum - currentOpenQty);
+            }
+
+            if (newTotalQty > instrumentLotSize) {
                 return res.status(400).json({
-                    message: `Maximum lot size for ${symbol} is ${instrumentLotSize}. You tried to place ${qtyNum} lots. Only ${instrumentLotSize} lot(s) allowed per trade.`
+                    message: `Maximum limit for ${baseSym} is ${instrumentLotSize} lot(s). You currently hold ${currentOpenQty} ${openType || ''} lot(s). This order would result in holding ${newTotalQty} lot(s).`
                 });
             }
 
-            console.log(`[placeOrder] ✅ Instrument lot validation: ${symbol} LOT=${instrumentLotSize}, Qty=${qtyNum}`);
+            console.log(`[placeOrder] ✅ Instrument lot validation: ${baseSym} Limit=${instrumentLotSize}, Held=${currentOpenQty} (${openType}), New=${qtyNum} (${orderTypeUpper}), Resulting=${newTotalQty}`);
         }
 
         // EQUITY lot size validation

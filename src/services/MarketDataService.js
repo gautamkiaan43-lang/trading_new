@@ -1,22 +1,15 @@
 const { KiteTicker } = require('kiteconnect');
 const socketManager = require('../websocket/SocketManager');
 const EventEmitter = require('events');
-const WebSocket = require('ws');
-const axios = require('axios');
 const alertMonitor = require('./alertMonitorService'); // ✅ Import alert monitor
 
-// ── Binance Config ──
-const BINANCE_REST_BASE = 'https://api.binance.com/api/v3';
-const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/stream?streams=';
+// ── AllTick Integration ──
+const allTicksService = require('./allticks.service');
 
+// Global state for symbols loaded from DB
 let CRYPTO_SYMBOLS_LIST = [];
 let FOREX_SYMBOLS_LIST = [];
-
-
 let SYMBOL_META = {};
-
-// ── FastForex Integration ──
-const fastForexService = require('./fastforex.service');
 
 /**
  * Optimized MarketDataService
@@ -41,23 +34,13 @@ class MarketDataService extends EventEmitter {
         this.subscribedSymbols = new Set();
         this.instrumentMap = {}; // token -> Set of symbols
 
-        // Binance Connection State
-        this.binanceWs = null;
-        this.isBinanceActive = false;
-        this.binanceReconnectAttempts = 0;
-        this.binanceError = null; // Track Binance specific errors
-        this.isBinanceBlocked = false; // Persistent block flag
-        this.binanceToFrontend = {};
-        this.frontendToBinance = {};
-
-        // Forex Polling State
-        this.forexInterval = null;
+        // AllTick Connection State
+        this.allTickInterval = null;
 
         // Broadcasting Optimization
         this.broadcastInterval = 150; // ms
         this.broadcastTimer = null;
 
-        this._initMappings();
         this._loadSymbolsFromDb();
         this._startBroadcastLoop();
     }
@@ -65,7 +48,7 @@ class MarketDataService extends EventEmitter {
     async _loadSymbolsFromDb() {
         try {
             const db = require('../config/db');
-            
+
             // Load Crypto
             const [cryptoRows] = await db.execute(`
                 SELECT symbol FROM market_group_items mgi 
@@ -94,19 +77,9 @@ class MarketDataService extends EventEmitter {
             SYMBOL_META = newMeta;
 
             console.log(`✅ Loaded ${CRYPTO_SYMBOLS_LIST.length} Crypto, ${FOREX_SYMBOLS_LIST.length} Forex, and ${Object.keys(SYMBOL_META).length} Meta entries from DB`);
-            
-            this._initMappings(); // Re-run mappings with new symbols
         } catch (err) {
             console.error('❌ Failed to load market data symbols from DB:', err.message);
         }
-    }
-
-    _initMappings() {
-        CRYPTO_SYMBOLS_LIST.forEach(sym => {
-            const bSym = sym.replace("/", "") + "T"; // BTC/USD -> BTCUSDT
-            this.frontendToBinance[sym] = bSym.toLowerCase();
-            this.binanceToFrontend[bSym.toUpperCase()] = sym;
-        });
     }
 
     /**
@@ -158,21 +131,24 @@ class MarketDataService extends EventEmitter {
         if (this.isConnecting) return;
         this.isConnecting = true;
         try {
-            if (this.ticker) {
-                try { this.ticker.disconnect(); } catch(e) {}
-                this.ticker = null;
-            }
-            // Check if Zerodha is configured
+            const repo = require('../repositories/KiteRepository');
+            const kiteService = require('../utils/kiteService');
+            const userSession = await repo.getSessionByUserId(userId);
+            const activeToken = kiteService.accessToken || (userSession ? userSession.access_token : null);
+
+            // 1. Check if Zerodha is configured
             if (!process.env.KITE_API_KEY) {
                 console.warn('⚠️ KITE_API_KEY not configured - Zerodha disabled');
                 this.isConnecting = false;
                 return;
             }
 
-            const repo = require('../repositories/KiteRepository');
-            const kiteService = require('../utils/kiteService');
-            const userSession = await repo.getSessionByUserId(userId);
-            const activeToken = kiteService.accessToken || (userSession ? userSession.access_token : null);
+            // 2. Avoid re-initializing if already connected with the same token
+            if (this.ticker && this.ticker.connected && this.currentToken === activeToken) {
+                console.log('✅ Zerodha already connected with active token.');
+                this.isConnecting = false;
+                return;
+            }
 
             if (!activeToken) {
                 console.warn('⚠️ No valid Zerodha session found for user - using mock engine');
@@ -180,21 +156,31 @@ class MarketDataService extends EventEmitter {
                 return;
             }
 
+            // 3. Clean up previous ticker if any
+            if (this.ticker) {
+                try { 
+                    this.ticker.removeAllListeners();
+                    this.ticker.disconnect(); 
+                } catch (e) { }
+                this.ticker = null;
+            }
+
+            this.currentToken = activeToken;
             console.log(`🔌 Initializing KiteTicker with token: ${activeToken.substring(0, 6)}...`);
-            this.ticker = new KiteTicker({
+            
+            const currentTicker = new KiteTicker({
                 api_key: process.env.KITE_API_KEY,
                 access_token: activeToken
             });
 
-            this.ticker.autoReconnect(false); // Disable auto-reconnect initially
+            this.ticker = currentTicker;
+            currentTicker.autoReconnect(true, 20, 5); 
 
             let errorOccurred = false;
 
-            this.ticker.on('connect', () => {
+            currentTicker.on('connect', () => {
                 console.log('✅ Zerodha Ticker Connected');
-                if (!this.ticker) return;
-
-                // Always subscribe NSE Indices (hardcoded Zerodha tokens)
+                
                 const INDEX_TOKENS = [
                     { token: 256265, symbol: 'NSE:NIFTY 50' },
                     { token: 260105, symbol: 'NSE:NIFTY BANK' },
@@ -207,12 +193,11 @@ class MarketDataService extends EventEmitter {
                     this.subscribedTokens.add(sToken);
                 });
 
-                // Resubscribe all tracked tokens safely
                 const tokenNums = Array.from(this.subscribedTokens).map(t => parseInt(t, 10)).filter(t => !isNaN(t));
-                if (tokenNums.length > 0 && this.ticker) {
+                if (tokenNums.length > 0) {
                     try {
-                        this.ticker.subscribe(tokenNums);
-                        this.ticker.setMode(this.ticker.modeFull, tokenNums);
+                        currentTicker.subscribe(tokenNums);
+                        currentTicker.setMode(currentTicker.modeFull, tokenNums);
                         console.log(`📊 Subscribed to ${tokenNums.length} tokens including NSE Indices`);
                     } catch (subErr) {
                         console.error('⚠️ Subscribe error on connect:', subErr.message);
@@ -220,69 +205,58 @@ class MarketDataService extends EventEmitter {
                 }
             });
 
-            this.ticker.on('ticks', (ticks) => {
-                this.handleTicks(ticks);
+            currentTicker.on('ticks', (ticks) => {
+                if (Array.isArray(ticks)) {
+                    this.handleTicks(ticks);
+                }
             });
 
-            this.ticker.on('error', (err) => {
+            currentTicker.on('error', (err) => {
                 const errMsg = err?.message || String(err);
                 console.error('⚠️ Zerodha Ticker Error:', errMsg);
 
-                // Handle 403 Forbidden — token expired
                 if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
-                    console.error('❌ Zerodha 403 Forbidden - Access token expired or invalid');
-                    console.log('💡 Solution: Need to login again at Zerodha');
+                    console.error('❌ Zerodha 403 Forbidden - Access token expired');
                     errorOccurred = true;
-                    try { this.ticker?.disconnect(); } catch(e) {}
-                    this.ticker = null;
-                    return;
+                    try { currentTicker.disconnect(); } catch (e) { }
+                    if (this.ticker === currentTicker) this.ticker = null;
                 }
-
-                // Other errors
-                console.error('❌ Critical Zerodha Error:', errMsg);
-                errorOccurred = true;
-                this.ticker = null;
             });
 
-            this.ticker.on('disconnect', () => {
+            currentTicker.on('disconnect', () => {
                 console.log('🔌 Zerodha Ticker Disconnected');
-                if (this.ticker && !errorOccurred) {
-                    this.ticker = null;
+                if (this.ticker === currentTicker && !errorOccurred) {
+                    // Only null it if it's the current active ticker and it wasn't a fatal error
+                    // Actually, if autoReconnect is on, we might not want to null it here.
                 }
             });
 
-            this.ticker.on('noreconnect', () => {
+            currentTicker.on('noreconnect', () => {
                 console.log('⛔ Zerodha Ticker: Max reconnect attempts reached');
-                errorOccurred = true;
-                this.ticker = null;
+                if (this.ticker === currentTicker) {
+                    this.ticker = null;
+                    this.currentToken = null;
+                }
             });
 
             try {
-                this.ticker.connect();
-                // Give ticker 5 seconds to connect before timing out
+                currentTicker.connect();
                 await new Promise((resolve) => {
                     const timeout = setTimeout(() => {
-                        if (!this.ticker || !this.ticker.connected) {
+                        if (!currentTicker.connected) {
                             console.error('⏱️ Zerodha Ticker connection timeout');
-                            errorOccurred = true;
-                            this.ticker = null;
                         }
                         resolve();
-                    }, 5000);
+                    }, 10000);
                 });
             } catch (connectErr) {
                 console.error('❌ Failed to connect Zerodha Ticker:', connectErr.message);
-                errorOccurred = true;
-                this.ticker = null;
+                if (this.ticker === currentTicker) this.ticker = null;
             }
         } catch (err) {
             console.error('⚠️ Zerodha Ticker init failed:', err.message);
-            this.ticker = null;
         } finally {
             this.isConnecting = false;
-            if (this.ticker === null || !this.ticker?.connected) {
-                console.log('ℹ️ Zerodha unavailable - will use mock engine for market data');
-            }
         }
     }
 
@@ -293,7 +267,7 @@ class MarketDataService extends EventEmitter {
         ticks.forEach(tick => {
             const token = String(tick.instrument_token);
             const symbols = this.instrumentMap[token] || new Set([token]);
-            
+
             symbols.forEach(symbol => {
                 const prev = this.prices[symbol] || {};
 
@@ -374,196 +348,18 @@ class MarketDataService extends EventEmitter {
         // Placeholder
     }
 
-    resubscribe() {
-        if (!this.ticker || !this.ticker.connected) return;
-        const tokens = Array.from(this.subscribedTokens).map(t => parseInt(t));
-        if (tokens.length > 0) {
-            this.ticker.subscribe(tokens);
-            this.ticker.setMode(this.ticker.modeFull, tokens);
-        }
-    }
-
-    // ══════════════════════════════════════════════════════
-    //   BINANCE INTEGRATION (Crypto)
+    //   ALLTICK INTEGRATION (Crypto & Forex)
     // ══════════════════════════════════════════════════════
 
     async startCryptoForex() {
-        if (this.isBinanceActive) return;
-        this.isBinanceActive = true;
-        console.log('🌐 Starting Optimized Binance (Crypto) + FastForex feeds');
-
-        // 1. Snapshot via REST for initial LTP and 24h stats
-        await this._fetchInitialBinanceData();
-
-        // 2. Connect WebSocket for Real-time LTP/Bid/Ask
-        this._connectBinanceWs();
-
-        // 3. Start FastForex Integration Service
-        fastForexService.start();
+        console.log('🌐 Starting AllTick (Forex + Crypto) feeds');
+        allTicksService.start();
     }
 
-    async _fetchInitialBinanceData() {
-        try {
-            this.binanceError = null; // Reset
-            const bSymbols = CRYPTO_SYMBOLS_LIST.map(s => this.frontendToBinance[s].toUpperCase());
-            const symbolsParam = JSON.stringify(bSymbols);
-            const url = `${BINANCE_REST_BASE}/ticker/24hr?symbols=${encodeURIComponent(symbolsParam)}`;
-
-            const response = await axios.get(url);
-
-            if (response.data && Array.isArray(response.data)) {
-                response.data.forEach(item => {
-                    const frontendSym = this.binanceToFrontend[item.symbol];
-                    if (!frontendSym) return;
-
-                    const symbolKey = `CRYPTO:${frontendSym}`;
-                    const meta = SYMBOL_META[frontendSym] || { name: frontendSym, category: 'crypto' };
-
-                    this.prices[symbolKey] = {
-                        ...this.prices[symbolKey],
-                        symbol: symbolKey,
-                        name: meta.name,
-                        category: meta.category,
-                        type: 'CRYPTO',
-                        ltp: parseFloat(item.lastPrice),
-                        change: parseFloat(item.priceChange),
-                        chg_pct: item.priceChangePercent,
-                        direction: parseFloat(item.priceChange) >= 0 ? 'up' : 'down'
-                    };
-                    this.dirtySymbols.add(symbolKey);
-                });
-            }
-        } catch (err) {
-            this.binanceError = `Binance Blocked: ${err.message}`;
-            console.error('⚠️ Binance Snapshot Error:', err.message);
-        }
+    stopCryptoForex() {
+        allTicksService.stop();
+        console.log('🛑 Stopped AllTick Integration');
     }
-
-    _connectBinanceWs() {
-        if (!this.isBinanceActive) return;
-
-        const bSymbols = CRYPTO_SYMBOLS_LIST.map(s => this.frontendToBinance[s]);
-        const streams = bSymbols.map(s => `${s}@miniTicker/${s}@bookTicker`).join('/');
-        const url = `${BINANCE_WS_BASE}${streams}`;
-
-        if (this.binanceWs) {
-            try { this.binanceWs.close(); } catch (e) { }
-        }
-
-        this.binanceWs = new WebSocket(url);
-
-        this.binanceWs.on('open', () => {
-            console.log('⚡ Binance WebSocket Connected');
-            this.binanceReconnectAttempts = 0;
-            this.isBinanceBlocked = false; // Reset if successful
-        });
-
-        this.binanceWs.on('message', (data) => {
-            try {
-                this._handleBinanceMessage(JSON.parse(data));
-            } catch (e) {
-                console.error('⚠️ Binance Msg Parse Error:', e.message);
-            }
-        });
-
-        this.binanceWs.on('error', (err) => {
-            const errMsg = err.message || String(err);
-            console.error('⚠️ Binance WS Error:', errMsg);
-
-            // Detect 451 (Unavailable For Legal Reasons) - Persistent block
-            if (errMsg.includes('451')) {
-                console.error('🚫 Binance is blocked in this region (Error 451). Switching to Twelve Data fallback for Crypto.');
-                this.isBinanceBlocked = true;
-                this.isBinanceActive = false; // Stop trying
-                this.binanceWs.close();
-            }
-        });
-
-        this.binanceWs.on('close', () => {
-            if (this.isBinanceActive && !this.isBinanceBlocked) {
-                const delay = Math.min(1000 * Math.pow(2, this.binanceReconnectAttempts), 30000);
-                console.log(`🔄 Binance WS closed. Reconnecting in ${delay / 1000}s...`);
-                setTimeout(() => {
-                    this.binanceReconnectAttempts++;
-                    this._connectBinanceWs();
-                }, delay);
-            } else if (this.isBinanceBlocked) {
-                console.log('ℹ️ Binance WS closed due to regional block. Reconnection disabled.');
-            }
-        });
-    }
-
-    _handleBinanceMessage(msg) {
-        if (!msg.data || !msg.stream) return;
-
-        const streamParts = msg.stream.split('@');
-        const bSymbol = streamParts[0].toUpperCase();
-        const type = streamParts[1]; // miniTicker or bookTicker
-        const frontendSym = this.binanceToFrontend[bSymbol];
-
-        if (!frontendSym) return;
-
-        const symbolKey = `CRYPTO:${frontendSym}`;
-        const current = this.prices[symbolKey] || {
-            symbol: symbolKey,
-            type: 'CRYPTO',
-            category: 'crypto',
-            name: SYMBOL_META[frontendSym]?.name || frontendSym,
-            ltp: 0, bid: 0, ask: 0, change: 0, chg_pct: '0.00'
-        };
-
-        const data = msg.data;
-        let changed = false;
-
-        if (type === 'miniTicker') {
-            // Requirement 1: miniTicker for LTP and Change
-            const ltp = parseFloat(data.c);
-            const open = parseFloat(data.o);
-            const change = ltp - open;
-            const chg_pct = open !== 0 ? ((change / open) * 100).toFixed(2) : '0.00';
-
-            if (current.ltp !== ltp || current.change !== change) {
-                current.ltp = ltp;
-                current.change = parseFloat(change.toFixed(4));
-                current.chg_pct = chg_pct;
-                current.direction = change >= 0 ? 'up' : 'down';
-                changed = true;
-            }
-        } else if (type === 'bookTicker') {
-            // Requirement 1: bookTicker for Bid/Ask
-            const bid = parseFloat(data.b);
-            const ask = parseFloat(data.a);
-
-            // Requirement 2: Ensure spread is correct (Ask > Bid)
-            if (bid > 0 && ask > 0 && ask >= bid) {
-                if (current.bid !== bid || current.ask !== ask) {
-                    current.bid = bid;
-                    current.ask = ask;
-                    changed = true;
-                }
-            } else if (bid > 0 && ask > 0) {
-                // Log invalid data cases
-                console.warn(`[Binance] Invalid Spread for ${bSymbol}: Bid=${bid}, Ask=${ask}`);
-            }
-        }
-
-        if (changed) {
-            this.prices[symbolKey] = current;
-            this.dirtySymbols.add(symbolKey);
-        }
-    }
-
-    // ══════════════════════════════════════════════════════
-    //   FOREX INTEGRATION
-    // ══════════════════════════════════════════════════════
-
-    async _fetchExternalData() {
-        // Obsolete: Handled by FastForexService
-    }
-
-    // ══════════════════════════════════════════════════════
-    //   PUBLIC GETTERS
-    // ══════════════════════════════════════════════════════
 
     getPrice(symbol) {
         return this.prices[symbol] || null;
@@ -579,25 +375,18 @@ class MarketDataService extends EventEmitter {
     }
 
     getCryptoPrices() {
+        if (!CRYPTO_SYMBOLS_LIST) return [];
         return CRYPTO_SYMBOLS_LIST.map(sym => this.prices[`CRYPTO:${sym}`]).filter(Boolean);
     }
 
-    getBinanceError() {
-        return this.binanceError;
-    }
-
     getForexPrices() {
+        if (!FOREX_SYMBOLS_LIST) return [];
         return FOREX_SYMBOLS_LIST.map(sym => this.prices[`FOREX:${sym}`]).filter(Boolean);
     }
 
-    stopCryptoForex() {
-        this.isBinanceActive = false;
-        if (this.binanceWs) {
-            this.binanceWs.close();
-            this.binanceWs = null;
-        }
-        fastForexService.stop();
-        console.log('🛑 Stopped Binance + FastForex Integration');
+    getBinanceError() {
+        // AllTick replaces Binance — no Binance error to report
+        return null;
     }
 
     shutdown() {

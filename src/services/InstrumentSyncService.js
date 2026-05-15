@@ -44,7 +44,7 @@ class InstrumentSyncService {
             // 1. Get base symbols from market_group_items
             const [baseRows] = await db.execute('SELECT DISTINCT symbol FROM market_group_items');
             const baseSymbols = new Set(baseRows.map(r => r.symbol.toUpperCase()));
-
+            
             if (baseSymbols.size === 0) {
                 console.warn('⚠️ [InstrumentSyncService] No base symbols found in market_group_items');
                 return { success: false, error: 'No base symbols' };
@@ -70,24 +70,17 @@ class InstrumentSyncService {
             for (const i of instruments) {
                 const symbol = i.tradingsymbol.toUpperCase();
                 const exchange = i.exchange;
-                const fullKey = `${exchange}:${symbol}`;
 
-                // STRICT MATCHING: Only sync what is explicitly in our market groups
-                if (!baseSymbols.has(symbol) && !baseSymbols.has(fullKey)) continue;
-
-                let marketType = null;
-                if (exchange === 'NSE') marketType = 'NSE';
-                else if (exchange === 'NFO') marketType = 'NFO';
-                else if (exchange === 'MCX') marketType = 'MCX';
-                else if (exchange === 'BSE') marketType = 'EQUITY';
-                else if (exchange === 'CDS' || exchange === 'BCD') marketType = 'FOREX';
-
-                if (!marketType) {
-                    continue; // Skip unsupported exchanges
+                // Sync all NSE, NFO, and MCX instruments so derivatives like NIFTY26MAYFUT are included with correct lot sizes
+                if (exchange !== 'NSE' && exchange !== 'NFO' && exchange !== 'MCX') {
+                    continue; // Skip BSE, BFO, CDS, etc. to avoid invalid market_type ENUM issues
                 }
 
-                if (seen.has(symbol)) continue;
-                seen.add(symbol);
+                let marketType = exchange; // 'NSE', 'NFO', or 'MCX'
+
+                const key = `${exchange}:${symbol}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
 
                 let lotSize = parseInt(i.lot_size) || 1;
                 // MCX Special Lot Size Handling
@@ -101,7 +94,7 @@ class InstrumentSyncService {
                     lot_size: lotSize,
                     market_type: marketType,
                     exchange: exchange,
-                    expiry: i.expiry ? i.expiry : null
+                    expiry: i.expiry || null
                 });
             }
 
@@ -113,21 +106,15 @@ class InstrumentSyncService {
             try {
                 await connection.beginTransaction();
 
-                // Clean old data (optional, but requested to remove "unnecessary" ones)
+                // Clean old data to ensure fresh lot sizes
                 await connection.execute('DELETE FROM scrip_data');
 
-                // Insert in batches
-                const batchSize = 100;
+                // Insert in batches of 2000 for better performance
+                const batchSize = 2000;
                 for (let i = 0; i < toSync.length; i += batchSize) {
                     const batch = toSync.slice(i, i + batchSize);
-                    const values = batch.map(item => [
-                        item.symbol,
-                        item.lot_size,
-                        50,
-                        item.market_type,
-                        item.expiry ? item.expiry : null
-                    ]);
-
+                    const values = batch.map(item => [item.symbol, item.lot_size, 50, item.market_type, item.expiry]);
+                    
                     await connection.query(
                         'INSERT INTO scrip_data (symbol, lot_size, margin_req, market_type, expiry_date) VALUES ?',
                         [values]

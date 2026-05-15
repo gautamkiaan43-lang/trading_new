@@ -8,7 +8,7 @@ class FastForexService {
         this.previousPrices = {};
         this.highPrices = {};
         this.lowPrices = {};
-        
+
         // Slashed versions matching DB seeded symbols
         this.forexPairsMap = {
             "AUDCAD": "AUD/CAD",
