@@ -61,14 +61,14 @@ class TradeService {
                 const { getMcxBaseScrip, MCX_LOT_SIZES } = require('../utils/symbolHelper');
                 const base = getMcxBaseScrip(trade.symbol);
                 const symTrimmed = (trade.symbol || '').toUpperCase().replace(/\d+.*/, '');
-                
+
                 // 1. Try Hardcoded MCX_LOT_SIZES first (Primary source)
                 if (base && MCX_LOT_SIZES[base]) {
                     lotSize = MCX_LOT_SIZES[base];
                 } else if (MCX_LOT_SIZES[symTrimmed]) {
                     lotSize = MCX_LOT_SIZES[symTrimmed];
                 }
-                
+
                 // 2. Try User Specific Override from client_settings
                 if (clientConfig && typeof clientConfig === 'object' && clientConfig.mcxLotMargins) {
                     const overrides = clientConfig.mcxLotMargins;
@@ -86,7 +86,7 @@ class TradeService {
             else if (mType === 'EQUITY' || mType === 'NSE' || mType === 'NFO' || mType === 'OPTIONS') {
                 // NSE/Equity generally uses 1 share = 1 unit for P/L calculation, 
                 // unless it's a derivative where we might need to check DB for lot_size.
-                lotSize = 1; 
+                lotSize = 1;
                 if (mType !== 'EQUITY') {
                     try {
                         const [scripRows] = await connection.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
@@ -122,37 +122,22 @@ class TradeService {
                 // 🎯 1. For Indian Segments, try Kite API (Direct Quote) FIRST for accuracy
                 if (isIndianSegment && kiteService.isAuthenticated()) {
                     try {
-                        const cleanSym = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
-                        const kitePatterns = [
-                            trade.symbol,
-                            `${mType === 'MCX' ? 'MCX' : (mType === 'EQUITY' ? 'NSE' : 'NFO')}:${cleanSym}`,
-                            `NSE:${cleanSym}`, `NFO:${cleanSym}`, `MCX:${cleanSym}`
-                        ];
-                        
-                        for (const kiteSym of kitePatterns) {
-                            console.log(`[TradeService] Fetching Real-time Kite Quote for ${kiteSym}...`);
-                            const quoteRes = await kiteService.getQuote(kiteSym);
-                            const quote = quoteRes[kiteSym];
-                            if (quote && quote.last_price > 0) {
-                                finalExitPrice = quote.last_price;
-                                console.log(`[TradeService] ✅ Real Zerodha Price Received (${kiteSym}): ${finalExitPrice}`);
-                                break;
-                            }
+                        const kiteSym = trade.symbol.includes(':') ? trade.symbol : (mType === 'MCX' ? `MCX:${trade.symbol}` : (mType === 'EQUITY' ? `NSE:${trade.symbol}` : `NFO:${trade.symbol}`));
+                        console.log(`[TradeService] Fetching Real-time Kite Quote for ${kiteSym}...`);
+                        const quoteRes = await kiteService.getQuote(kiteSym);
+                        const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
+                        if (quote && quote.last_price > 0) {
+                            finalExitPrice = quote.last_price;
+                            console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice}`);
                         }
                     } catch (e) {
-                        console.warn(`[TradeService] Kite Quote search failed:`, e.message);
+                        console.warn(`[TradeService] Kite Quote Fallback triggered:`, e.message);
                     }
                 }
 
-                // 🎯 2. Try Memory Ticker (Fallback or for Forex/Crypto)
+                // 🎯 2. Try Memory Ticker (Primary for Forex/Crypto, Fallback for others)
                 if (!finalExitPrice || finalExitPrice <= 0) {
-                    const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
-                    const searchPatterns = [
-                        trade.symbol,
-                        `MCX:${cleanSymbol}`, `NFO:${cleanSymbol}`, `NSE:${cleanSymbol}`,
-                        `CRYPTO:${cleanSymbol}`, `FOREX:${cleanSymbol}`, `COMEX:${cleanSymbol}`,
-                        cleanSymbol
-                    ];
+                    const searchPatterns = [trade.symbol, `MCX:${trade.symbol}`, `NFO:${trade.symbol}`, `NSE:${trade.symbol}`, `FOREX:${trade.symbol}`, `CRYPTO:${trade.symbol}`];
                     let liveData = null;
                     for (const p of searchPatterns) {
                         liveData = marketDataService.getPrice(p);
@@ -161,7 +146,7 @@ class TradeService {
 
                     if (liveData) {
                         finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
-                        console.log(`[TradeService] Found in Memory Ticker: ${finalExitPrice}`);
+                        console.log(`[TradeService] Found in Ticker: ${finalExitPrice}`);
                     }
                 }
 
@@ -179,12 +164,16 @@ class TradeService {
                 pnl = parseFloat(providedPnl);
                 console.log(`[TradeService] Using provided P/L: ${pnl}`);
             } else {
-                // 🎯 FIXED: Always use (qty * lotSize) for consistent P/L across all segments
-                const qtyForPnl = trade.qty * lotSize;
+                // 🎯 FIXED: Use actual_qty (total units) if available, fallback to qty * lotSize
+                const qtyForPnl = (trade.actual_qty && parseFloat(trade.actual_qty) > 0) 
+                    ? parseFloat(trade.actual_qty) 
+                    : (trade.qty * lotSize);
+                    
                 pnl = trade.type === 'BUY'
                     ? (finalExitPrice - trade.entry_price) * qtyForPnl
                     : (trade.entry_price - finalExitPrice) * qtyForPnl;
-                console.log(`[TradeService] Calculated P/L using qty×lotSize (${trade.qty}×${lotSize}): ${pnl}`);
+                    
+                console.log(`[TradeService] Calculated P/L using ${trade.actual_qty ? 'actual_qty' : 'qty×lotSize'} (${qtyForPnl}): ${pnl}`);
             }
 
             // 4. Calculate Brokerage & Swap

@@ -64,14 +64,18 @@ class RMSService {
 
             // 3. Calculate Total Floating PnL
             let totalPnL = 0;
+            const { getLotSize } = require('../utils/symbolHelper');
+
             for (const trade of trades) {
                 const liveData = marketDataService.getPrice(trade.symbol);
                 if (!liveData) continue;
 
                 const currentPrice = trade.type === 'BUY' ? (liveData.bid || liveData.ltp) : (liveData.ask || liveData.ltp);
+                const lotSize = getLotSize(trade.symbol, trade.market_type);
+                
                 const pnl = trade.type === 'BUY'
-                    ? (currentPrice - trade.entry_price) * trade.qty
-                    : (trade.entry_price - currentPrice) * trade.qty;
+                    ? (currentPrice - trade.entry_price) * trade.qty * lotSize
+                    : (trade.entry_price - currentPrice) * trade.qty * lotSize;
                 
                 totalPnL += pnl;
             }

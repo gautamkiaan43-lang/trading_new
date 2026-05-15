@@ -229,15 +229,11 @@ const getClientLiveM2M = async (req, res) => {
 
             const lotSize = getMultiplier(trade.symbol, mType, userConfig);
 
-            // App Sync logic: 
-            // For MCX, totalUnits is ALWAYS qty * multiplier (lotSize)
-            // For NSE, qty is already the number of units/shares.
-            let totalUnits = qty * lotSize;
-
-            // Fallback to actual_qty only for non-MCX if it exists
-            if (mType !== 'MCX' && trade.actual_qty && parseFloat(trade.actual_qty) > 0) {
-                totalUnits = parseFloat(trade.actual_qty);
-            }
+            // 🎯 FIXED: Always prioritize actual_qty (total units) for all segments including MCX
+            // This prevents double-multiplication of lot sizes.
+            let totalUnits = (trade.actual_qty && parseFloat(trade.actual_qty) > 0)
+                ? parseFloat(trade.actual_qty)
+                : (qty * lotSize);
 
             const tradeValue = entryPrice * totalUnits;
 
@@ -295,7 +291,7 @@ const getClientLiveM2M = async (req, res) => {
                 if (!clientMap[trade.user_id]) {
                     clientMap[trade.user_id] = {
                         id: trade.user_id, username: trade.username,
-                        activePL: 0, activeTrades: 0, margin: 0, balance: parseFloat(trade.balance || 0)
+                        activePL: 0, realizedToday: 0, activeTrades: 0, margin: 0, balance: parseFloat(trade.balance || 0)
                     };
                 }
                 clientMap[trade.user_id].activePL += unrealizedPnl;
@@ -356,19 +352,14 @@ const getClientLiveM2M = async (req, res) => {
 
                 clientMap[trade.user_id].margin += dynamicMargin;
             } else if (trade.status === 'CLOSED') {
-                // ✅ FIXED: Only include realized PnL in the daily summary if it was closed TODAY
-                const today = new Date();
-                const todayStr = today.getFullYear() + '-' + (today.getMonth() + 1).toString().padStart(2, '0') + '-' + today.getDate().toString().padStart(2, '0');
-                
-                let exitDateStr = '';
-                if (trade.exit_time) {
-                    const ed = new Date(trade.exit_time);
-                    exitDateStr = ed.getFullYear() + '-' + (ed.getMonth() + 1).toString().padStart(2, '0') + '-' + ed.getDate().toString().padStart(2, '0');
+                // Track realized P/L for today's closed trades to help with M2M vs Ledger clarity
+                if (!clientMap[trade.user_id]) {
+                    clientMap[trade.user_id] = {
+                        id: trade.user_id, username: trade.username,
+                        activePL: 0, realizedToday: 0, activeTrades: 0, margin: 0, balance: parseFloat(trade.balance || 0)
+                    };
                 }
-
-                if (exitDateStr === todayStr) {
-                    stats.profitLoss[segment] += parseFloat(trade.pnl || 0);
-                }
+                clientMap[trade.user_id].realizedToday += parseFloat(trade.pnl || 0);
             }
         });
 
@@ -389,6 +380,12 @@ const getClientLiveM2M = async (req, res) => {
 
         const formattedClients = Object.values(clientMap).map(c => {
             const netCapital = c.balance + c.activePL;
+            
+            // 🎯 USER REQUEST: M2M should NOT include realized P/L from closed trades.
+            // It should only reflect active open trades.
+            // So M2M = (Current Balance - Today's Realized) + Active Unrealized
+            const m2mDisplay = netCapital - c.realizedToday;
+
             let shortfall = 0;
             if (c.margin > netCapital && netCapital > 0) {
                 shortfall = c.margin - netCapital;
@@ -413,8 +410,10 @@ const getClientLiveM2M = async (req, res) => {
             return {
                 ...c,
                 ledger: c.balance.toFixed(2),
-                m2m: netCapital.toFixed(2),
+                m2m: m2mDisplay.toFixed(2),
                 activePL: c.activePL.toFixed(2),
+                realizedToday: c.realizedToday.toFixed(2),
+                floatingPL: c.activePL.toFixed(2),
                 margin: c.margin.toFixed(2),
                 marginShortfall: shortfall.toFixed(2),
                 positions
