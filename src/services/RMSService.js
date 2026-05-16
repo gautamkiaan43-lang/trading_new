@@ -57,26 +57,22 @@ class RMSService {
 
             // 2. Parse Config and Thresholds
             let config = {};
-            try { config = JSON.parse(user.config_json || '{}'); } catch (e) {}
-            
+            try { config = JSON.parse(user.config_json || '{}'); } catch (e) { }
+
             // Respect the "Auto Close Trades if condition met" checkbox (isAutoCloseEnabled)
-            const isAutoCloseActive = config.autoCloseEnabled !== false; 
+            const isAutoCloseActive = config.autoCloseEnabled !== false;
 
             // 3. Calculate Total Floating PnL
             let totalPnL = 0;
-            const { getLotSize } = require('../utils/symbolHelper');
-
             for (const trade of trades) {
                 const liveData = marketDataService.getPrice(trade.symbol);
                 if (!liveData) continue;
 
                 const currentPrice = trade.type === 'BUY' ? (liveData.bid || liveData.ltp) : (liveData.ask || liveData.ltp);
-                const lotSize = getLotSize(trade.symbol, trade.market_type);
-                
                 const pnl = trade.type === 'BUY'
-                    ? (currentPrice - trade.entry_price) * trade.qty * lotSize
-                    : (trade.entry_price - currentPrice) * trade.qty * lotSize;
-                
+                    ? (currentPrice - trade.entry_price) * trade.qty
+                    : (trade.entry_price - currentPrice) * trade.qty;
+
                 totalPnL += pnl;
             }
 
@@ -88,33 +84,33 @@ class RMSService {
             const notifyThreshold = parseFloat(user.notify_at_m2m_pct ?? 70);
 
             // 4. Check Thresholds
-            
+
             // ACTION A: AUTO-CLOSE (Critical)
             if (totalPnL < 0 && lossPercentage >= autoCloseThreshold && isAutoCloseActive) {
                 console.log(`[RMSService] 🚨 DYNAMIC AUTO-CLOSE for User #${user.id}: Loss=${lossPercentage.toFixed(2)}% (Threshold: ${autoCloseThreshold}%)`);
-                
+
                 const remark = `${Math.round(autoCloseThreshold)}% Loss Limit Breached`;
                 await tradeService.closeAllUserTrades(user.id, 0, 'RMS_AUTO_CLOSE', remark);
-                
+
                 // Notify user via socket immediately
                 this.sendSocketAlert(user.id, `🚨 AUTO-SQUARE OFF: Account losses reached ${lossPercentage.toFixed(2)}% of balance. All trades closed automatically.`);
-                return; 
+                return;
             }
 
             // ACTION B: NOTIFY (Warning)
             if (totalPnL < 0 && lossPercentage >= notifyThreshold) {
                 const now = Date.now();
                 const lastNotify = this.lastNotificationTime.get(user.id) || 0;
-                
+
                 // Notify every 5 minutes (300,000 ms) as per requirement
                 if (now - lastNotify > 300000) {
                     console.log(`[RMSService] 🔔 NOTIFY TRIGGERED for User #${user.id}: Loss=${lossPercentage.toFixed(2)}%`);
-                    
+
                     await db.execute(
                         'INSERT INTO notifications (user_id, message, type) VALUES (?, ?, ?)',
                         [user.id, `⚠️ Account Margin Warning: Your losses have reached ${lossPercentage.toFixed(2)}% of ledger balance. Please add funds to avoid auto-square off.`, 'LOSS_WARNING']
                     );
-                    
+
                     this.sendSocketAlert(user.id, `⚠️ Margin Warning: Loss reached ${lossPercentage.toFixed(2)}%`);
                     this.lastNotificationTime.set(user.id, now);
                 }
@@ -141,6 +137,15 @@ class RMSService {
             this.interval = null;
         }
     }
+}
+
+module.exports = new RMSService();
+stop() {
+    if (this.interval) {
+        clearInterval(this.interval);
+        this.interval = null;
+    }
+}
 }
 
 module.exports = new RMSService();

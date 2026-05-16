@@ -380,7 +380,7 @@ const placeOrder = async (req, res) => {
             // ─── INSTRUMENT-SPECIFIC LOT SIZE VALIDATION ─────────────────────
             // Fetch the base symbol (e.g., GOLD for GOLD26JUNFUT) to match with mcxLotMargins config
             const baseSym = getMcxBaseScrip(symbol) || symbol.toUpperCase();
-            
+
             // Get the configured LOT limit for this specific instrument. If not set, fallback to global MCX max lot
             let instrumentLotSize = parseInt(clientConfig?.mcxLotMargins?.[baseSym]?.LOT);
             if (isNaN(instrumentLotSize)) {
@@ -395,7 +395,7 @@ const placeOrder = async (req, res) => {
                  GROUP BY type`,
                 [targetUserId, `%${baseSym}%`]
             );
-            
+
             let currentOpenBuyQty = 0;
             let currentOpenSellQty = 0;
             for (const row of openBaseTrades) {
@@ -408,7 +408,7 @@ const placeOrder = async (req, res) => {
 
             let newTotalQty = qtyNum;
             const orderTypeUpper = type.toUpperCase();
-            
+
             if (openType === orderTypeUpper) {
                 // Adding to existing position
                 newTotalQty = currentOpenQty + qtyNum;

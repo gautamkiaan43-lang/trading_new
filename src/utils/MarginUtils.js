@@ -19,7 +19,7 @@ const MarginUtils = {
                 const brokerMargins = clientConfig.mcxLotMargins || {};
                 const upperSym = (trade.symbol || '').toUpperCase();
                 const baseScrip = this.getMcxBaseScrip(trade.symbol, brokerMargins);
-                
+
                 // Priority 1: Scrip-specific Lot-wise HOLDING Margin (Fixed Amount or Exposure)
                 const scripConfig = brokerMargins[upperSym] || brokerMargins[baseScrip];
                 const holdingMarginValue = parseFloat(scripConfig?.HOLDING || scripConfig?.holding_exposure || 0);
@@ -43,7 +43,7 @@ const MarginUtils = {
                 tradeMargin = turnover / (holdingExposure || 1);
             } else if (mType === 'OPTIONS') {
                 // Options typically use a divisor of 1 or a small value
-                tradeMargin = turnover / 1; 
+                tradeMargin = turnover / 1;
             } else if (mType === 'COMEX' || mType === 'FOREX' || mType === 'CRYPTO') {
                 const segConfig = clientConfig[`${mType.toLowerCase()}Config`] || {};
                 const holdingExposure = parseFloat(segConfig.holdingMargin || segConfig.intradayMargin || 100);
@@ -65,7 +65,7 @@ const MarginUtils = {
         if (!symbol) return '';
         const s = symbol.split(':').pop().toUpperCase();
         const cleanS = s.replace(/\s+/g, '');
-        
+
         // 1. Try to match keys in the config directly (Longest match first)
         // This handles cases like "CRUDEOIL MINI" vs "CRUDEOIL"
         if (configKeys) {

@@ -164,16 +164,12 @@ class TradeService {
                 pnl = parseFloat(providedPnl);
                 console.log(`[TradeService] Using provided P/L: ${pnl}`);
             } else {
-                // 🎯 FIXED: Use actual_qty (total units) if available, fallback to qty * lotSize
-                const qtyForPnl = (trade.actual_qty && parseFloat(trade.actual_qty) > 0) 
-                    ? parseFloat(trade.actual_qty) 
-                    : (trade.qty * lotSize);
-                    
+                // 🎯 FIXED: Always use (qty * lotSize) for consistent P/L across all segments
+                const qtyForPnl = trade.qty * lotSize;
                 pnl = trade.type === 'BUY'
                     ? (finalExitPrice - trade.entry_price) * qtyForPnl
                     : (trade.entry_price - finalExitPrice) * qtyForPnl;
-                    
-                console.log(`[TradeService] Calculated P/L using ${trade.actual_qty ? 'actual_qty' : 'qty×lotSize'} (${qtyForPnl}): ${pnl}`);
+                console.log(`[TradeService] Calculated P/L using qty×lotSize (${trade.qty}×${lotSize}): ${pnl}`);
             }
 
             // 4. Calculate Brokerage & Swap
