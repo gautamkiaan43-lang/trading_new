@@ -6,6 +6,60 @@ const { invalidateCache } = require('../utils/cacheManager');
 const { getMcxBaseScrip } = require('../utils/symbolHelper');
 const MarginService = require('../services/MarginService');
 
+const syncPaperPosition = async (userId, symbol) => {
+    try {
+        console.log(`[syncPaperPosition] Syncing paper position for user ${userId}, symbol ${symbol}`);
+        const [trades] = await db.execute(
+            "SELECT type, qty, entry_price FROM trades WHERE user_id = ? AND symbol = ? AND status = 'OPEN' AND is_pending = 0",
+            [userId, symbol]
+        );
+
+        let totalBuyQty = 0;
+        let totalBuyCost = 0;
+        let totalSellQty = 0;
+        let totalSellCost = 0;
+
+        for (const trade of trades) {
+            const qty = parseFloat(trade.qty);
+            const entryPrice = parseFloat(trade.entry_price);
+            if (trade.type.toUpperCase() === 'BUY') {
+                totalBuyQty += qty;
+                totalBuyCost += qty * entryPrice;
+            } else if (trade.type.toUpperCase() === 'SELL') {
+                totalSellQty += qty;
+                totalSellCost += qty * entryPrice;
+            }
+        }
+
+        const netQty = totalBuyQty - totalSellQty;
+        let avgPrice = 0;
+        if (netQty > 0) {
+            avgPrice = totalBuyQty > 0 ? (totalBuyCost / totalBuyQty) : 0;
+        } else if (netQty < 0) {
+            avgPrice = totalSellQty > 0 ? (totalSellCost / totalSellQty) : 0;
+        }
+
+        if (netQty === 0) {
+            // Delete position if closed
+            await db.execute(
+                "DELETE FROM paper_positions WHERE user_id = ? AND symbol = ?",
+                [userId, symbol]
+            );
+            console.log(`[syncPaperPosition] Deleted paper position (netQty = 0)`);
+        } else {
+            // Insert or update position
+            await db.execute(
+                `INSERT INTO paper_positions (user_id, symbol, quantity, avg_price)
+                 VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE quantity = ?, avg_price = ?, updated_at = CURRENT_TIMESTAMP`,
+                [userId, symbol, netQty, avgPrice, netQty, avgPrice]
+            );
+            console.log(`[syncPaperPosition] Synced paper position: quantity = ${netQty}, avg_price = ${avgPrice}`);
+        }
+    } catch (err) {
+        console.error(`[syncPaperPosition] Error syncing paper position:`, err.message);
+    }
+};
 
 /**
  * Place a New Order
@@ -674,32 +728,12 @@ const placeOrder = async (req, res) => {
             // MCX LOT SIZE LOGIC
             // ══════════════════════════════════════════════════════════════════
             if (marketType === 'MCX') {
-                // 1. Priority: User Specific Dynamic Lot Size (from UI/Config)
-                if (clientConfig && clientConfig.mcxLotMargins) {
-                    const base = getMcxBaseScrip(symbol) || symbol.toUpperCase();
-                    const configLot = clientConfig.mcxLotMargins[base]?.LOT || clientConfig.mcxLotMargins[symbol.toUpperCase()]?.LOT;
-                    if (configLot && parseFloat(configLot) > 0) {
-                        lotSize = parseFloat(configLot);
-                        console.log(`[placeOrder] 🎯 MCX Dynamic Lot Size from Config: ${symbol} → ${lotSize}`);
-                    } else {
-                        // 2. Hardcoded MCX Lot Sizes
-                        const baseFallback = getMcxBaseScrip(symbol);
-                        if (baseFallback && MCX_LOT_SIZES[baseFallback]) {
-                            lotSize = MCX_LOT_SIZES[baseFallback];
-                            console.log(`[placeOrder] 📊 MCX Lot Size (Hardcoded): ${symbol} → ${lotSize}`);
-                        } else {
-                            lotSize = 1;
-                        }
-                    }
+                const base = getMcxBaseScrip(symbol);
+                if (base && MCX_LOT_SIZES[base]) {
+                    lotSize = MCX_LOT_SIZES[base];
+                    console.log(`[placeOrder] 📊 MCX Lot Size (Hardcoded): ${symbol} → ${lotSize}`);
                 } else {
-                    // Classic flow if config missing
-                    const base = getMcxBaseScrip(symbol);
-                    if (base && MCX_LOT_SIZES[base]) {
-                        lotSize = MCX_LOT_SIZES[base];
-                        console.log(`[placeOrder] 📊 MCX Lot Size (Hardcoded): ${symbol} → ${lotSize}`);
-                    } else {
-                        lotSize = 1;
-                    }
+                    lotSize = 1;
                 }
             }
             // ══════════════════════════════════════════════════════════════════
@@ -1353,6 +1387,9 @@ const placeOrder = async (req, res) => {
         console.log(`[placeOrder] ℹ️ Ledger Balance: ${targetUser.balance} (unchanged)`);
 
         console.log('✅ Trade Inserted:', result.insertId);
+        if (!is_pending) {
+            await syncPaperPosition(targetUserId, sym);
+        }
         res.status(201).json({
             message: 'Order placed successfully',
             tradeId: result.insertId,
@@ -1365,6 +1402,26 @@ const placeOrder = async (req, res) => {
             leverage: leverageUsed,
             equityUnitsMode
         });
+
+        // Notify user via socket for real-time UI update
+        try {
+            const { getIo } = require('../config/socket');
+            const io = getIo();
+            if (io) {
+                io.to(`user:${targetUserId}`).emit('notification', {
+                    message: `New ${type.toUpperCase()} order for ${sym.includes(':') ? sym.split(':')[1] : sym} placed successfully at ₹${executionPrice}`,
+                    type: 'ORDER_PLACED',
+                    tradeId: result.insertId
+                });
+                io.to(`user:${targetUserId}`).emit('trade_update', {
+                    id: result.insertId,
+                    is_pending: is_pending ? 1 : 0,
+                    status: 'OPEN'
+                });
+            }
+        } catch (socketErr) {
+            console.error('[placeOrder] Socket emit error:', socketErr.message);
+        }
 
         // Log the trade placement with new fields
         await logAction(requesterId, 'PLACE_ORDER', 'trades',
@@ -1700,11 +1757,31 @@ const closeTrade = async (req, res) => {
 
         // ─── EXECUTE CLOSURE VIA SERVICE ──────────────────────────────────
         const result = await tradeService.closeTrade(trade.id, exitPrice, requesterId, pnl);
+        await syncPaperPosition(trade.user_id, trade.symbol);
 
         res.json({
             message: 'Trade closed successfully',
             ...result
         });
+
+        // Notify user via socket for real-time UI update
+        try {
+            const { getIo } = require('../config/socket');
+            const io = getIo();
+            if (io) {
+                io.to(`user:${trade.user_id}`).emit('notification', {
+                    message: `Your trade for ${trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol} has been closed`,
+                    type: 'TRADE_CLOSED',
+                    tradeId: trade.id
+                });
+                io.to(`user:${trade.user_id}`).emit('trade_update', {
+                    id: trade.id,
+                    status: 'CLOSED'
+                });
+            }
+        } catch (socketErr) {
+            console.error('[closeTrade] Socket emit error:', socketErr.message);
+        }
     } catch (err) {
         console.error('❌ Close Trade Error:', err);
         res.status(500).json({ message: 'Server Error', error: err.message });
@@ -1737,6 +1814,7 @@ const deleteTrade = async (req, res) => {
         const balanceRefund = marginToRefund + pnlToRefund;
 
         await db.execute('UPDATE trades SET status = "DELETED", exit_time = NOW() WHERE id = ?', [req.params.id]);
+        await syncPaperPosition(trade.user_id, trade.symbol);
 
         if (balanceRefund !== 0) {
             await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [balanceRefund, trade.user_id]);
@@ -1753,6 +1831,25 @@ const deleteTrade = async (req, res) => {
         }
 
         res.json({ message: 'Trade deleted and refunded', marginRefunded: marginToRefund, pnlRefunded: pnlToRefund });
+
+        // Notify user via socket for real-time UI update
+        try {
+            const { getIo } = require('../config/socket');
+            const io = getIo();
+            if (io) {
+                io.to(`user:${trade.user_id}`).emit('notification', {
+                    message: `Your trade for ${trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol} has been deleted by admin`,
+                    type: 'TRADE_DELETED',
+                    tradeId: trade.id
+                });
+                io.to(`user:${trade.user_id}`).emit('trade_update', {
+                    id: trade.id,
+                    status: 'DELETED'
+                });
+            }
+        } catch (socketErr) {
+            console.error('[deleteTrade] Socket emit error:', socketErr.message);
+        }
     } catch (err) {
         console.error('Delete Trade Error:', err);
         res.status(500).json({ message: 'Server Error' });
@@ -1851,10 +1948,30 @@ const updateTrade = async (req, res) => {
 
         params.push(req.params.id);
         await db.execute(`UPDATE trades SET ${updates.join(', ')} WHERE id = ?`, params);
+        await syncPaperPosition(trade.user_id, trade.symbol);
 
         await logAction(req.user.id, 'UPDATE_TRADE', 'trades', `Updated trade #${req.params.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);
 
         res.json({ message: 'Trade updated successfully' });
+
+        // Notify user via socket for real-time UI update
+        try {
+            const { getIo } = require('../config/socket');
+            const io = getIo();
+            if (io) {
+                io.to(`user:${trade.user_id}`).emit('notification', {
+                    message: `Your trade for ${trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol} has been updated by admin`,
+                    type: 'TRADE_UPDATED',
+                    tradeId: trade.id
+                });
+                io.to(`user:${trade.user_id}`).emit('trade_update', {
+                    id: trade.id,
+                    status: trade.status
+                });
+            }
+        } catch (socketErr) {
+            console.error('[updateTrade] Socket emit error:', socketErr.message);
+        }
     } catch (err) {
         console.error('Update Trade Error:', err);
         res.status(500).json({ message: 'Server Error' });
@@ -1898,6 +2015,7 @@ const restoreTrade = async (req, res) => {
             'UPDATE trades SET status = "OPEN", exit_price = NULL, exit_time = NULL, pnl = 0 WHERE id = ?',
             [req.params.id]
         );
+        await syncPaperPosition(trade.user_id, trade.symbol);
 
         // Reverse balance: deduct the PnL that was added on close
         if (balanceDeduction !== 0) {
@@ -1907,6 +2025,25 @@ const restoreTrade = async (req, res) => {
         await logAction(req.user.id, 'RESTORE_TRADE', 'trades', `Restored trade #${req.params.id} to OPEN. PnL reversed: ${pnl}`);
 
         res.json({ message: 'Trade restored to OPEN', pnlReversed: pnl });
+
+        // Notify user via socket for real-time UI update
+        try {
+            const { getIo } = require('../config/socket');
+            const io = getIo();
+            if (io) {
+                io.to(`user:${trade.user_id}`).emit('notification', {
+                    message: `Your trade for ${trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol} has been restored to OPEN by admin`,
+                    type: 'TRADE_RESTORED',
+                    tradeId: trade.id
+                });
+                io.to(`user:${trade.user_id}`).emit('trade_update', {
+                    id: trade.id,
+                    status: 'OPEN'
+                });
+            }
+        } catch (socketErr) {
+            console.error('[restoreTrade] Socket emit error:', socketErr.message);
+        }
     } catch (err) {
         console.error('Restore Trade Error:', err);
         res.status(500).json({ message: 'Server Error' });
@@ -1956,24 +2093,14 @@ const modifyPendingOrder = async (req, res) => {
                         'MENTHAOIL': 360, 'COTTON': 100, 'BULLDEX': 100, 'CRUDEOIL MINI': 10
                     };
 
-                    const [configRows] = await db.execute('SELECT config_json FROM client_settings WHERE user_id = ?', [trade.user_id]);
                     let lotSize = 1;
-
-                    if (configRows.length > 0) {
-                        const clientConfig = JSON.parse(configRows[0].config_json || '{}');
-                        const baseSym = getMcxBaseScrip(trade.symbol) || trade.symbol.toUpperCase();
-                        lotSize = parseFloat(clientConfig?.mcxLotMargins?.[baseSym]?.LOT || 1);
-                    }
-
-                    if (!lotSize || lotSize <= 1) {
-                        const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
-                        if (scripRows.length > 0) {
-                            lotSize = parseFloat(scripRows[0].lot_size || 1);
-                        } else {
-                            const baseSym = getMcxBaseScrip(trade.symbol);
-                            if (baseSym && MCX_LOT_SIZES[baseSym]) {
-                                lotSize = MCX_LOT_SIZES[baseSym];
-                            }
+                    const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ?', [trade.symbol]);
+                    if (scripRows.length > 0) {
+                        lotSize = parseFloat(scripRows[0].lot_size || 1);
+                    } else {
+                        const baseSym = getMcxBaseScrip(trade.symbol);
+                        if (baseSym && MCX_LOT_SIZES[baseSym]) {
+                            lotSize = MCX_LOT_SIZES[baseSym];
                         }
                     }
 

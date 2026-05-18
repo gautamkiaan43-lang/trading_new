@@ -125,7 +125,7 @@ function getTokenSync(symbol) {
 const WATCHLIST_CACHE_BUST = 'watchlist_v7_custom_mcx_continuous';
 
 /** NFO index options included in unified watchlist (instruments + quotes from Kite only). */
-const NFO_INDEX_OPTION_UNDERLYINGS = new Set(['NIFTY', 'BANKNIFTY', 'FINNIFTY']);
+const NFO_INDEX_OPTION_UNDERLYINGS = new Set(['NIFTY', 'BANKNIFTY']);
 
 let NIFTY50 = [];
 let BANKNIFTY = [];
@@ -370,14 +370,18 @@ function getOptionStrikeStepNfo(underlying) {
 }
 
 const MCX_ALLOWED_WATCHLIST = [
+    // Mega contracts
     'GOLD', 'SILVER', 'CRUDEOIL', 'COPPER', 'ZINC', 'ALUMINIUM', 'LEAD', 'NATURALGAS',
+    'NICKEL', 'GOLDPETAL', 'GOLDGUINEA', 'COTTON', 'COTTONCNDY', 'MENTHAOIL',
+    // Mini contracts
     'GOLDM', 'SILVERM', 'CRUDEOILM', 'ZINCMINI', 'LEADMINI', 'COPPERM', 'NATURALGASMINI',
-    'ALUMINI',
+    'ALUMINI', 'NICKELMINI',
+    // Micro (M-series) contracts
     'MGOLD', 'MCRUDEOIL', 'MSILVER', 'MNATURALGAS', 'MCOPPER', 'MLEAD', 'MZINC', 'MALUMINIUM',
 ];
 
-/** Unified watchlist: MCX options only for Crude + Natural Gas (incl. mini); other MCX bases = nearest FUT only */
-const MCX_OPTION_UNDERLYINGS_DEFAULT = ['CRUDEOIL', 'CRUDEOILM', 'NATURALGAS', 'NATURALGASMINI'];
+/** Unified watchlist: MCX options for Crude, NatGas, Gold, Silver (incl. minis) */
+const MCX_OPTION_UNDERLYINGS_DEFAULT = ['CRUDEOIL', 'CRUDEOILM', 'NATURALGAS', 'NATURALGASMINI', 'GOLD', 'GOLDM', 'SILVER', 'SILVERM'];
 
 const MCX_CANONICAL_MAP = {
     // Project-internal (instrument name) vs requirement names
@@ -470,6 +474,9 @@ async function sleep(ms) {
  * Without a positive spot, Step 2 skips the whole chain → NFO tab count swings (e.g. ~53 vs ~800+).
  */
 function resolveNfoIndexSpotLtp(ltpQuotes, cfg) {
+    if (!global.LAST_KNOWN_LTPS) {
+        global.LAST_KNOWN_LTPS = {};
+    }
     const fromQuote = (key) => {
         if (!key || !ltpQuotes || !ltpQuotes[key]) return 0;
         const q = ltpQuotes[key];
@@ -482,12 +489,30 @@ function resolveNfoIndexSpotLtp(ltpQuotes, cfg) {
         return 0;
     };
     let ltp = fromQuote(cfg.idxKey);
-    if (ltp > 0) return ltp;
-    if (cfg.futKey) {
+    if (!ltp && cfg.futKey) {
         ltp = fromQuote(cfg.futKey);
-        if (ltp > 0) return ltp;
     }
-    return 0;
+    const cacheKey = cfg.underlying || cfg.idxKey;
+    if (ltp > 0) {
+        global.LAST_KNOWN_LTPS[cacheKey] = ltp;
+        if (cfg.idxKey) global.LAST_KNOWN_LTPS[cfg.idxKey] = ltp;
+        if (cfg.futKey) global.LAST_KNOWN_LTPS[cfg.futKey] = ltp;
+        return ltp;
+    }
+    if (global.LAST_KNOWN_LTPS[cacheKey] && global.LAST_KNOWN_LTPS[cacheKey] > 0) {
+        return global.LAST_KNOWN_LTPS[cacheKey];
+    }
+    if (cfg.idxKey && global.LAST_KNOWN_LTPS[cfg.idxKey] && global.LAST_KNOWN_LTPS[cfg.idxKey] > 0) {
+        return global.LAST_KNOWN_LTPS[cfg.idxKey];
+    }
+    const defaults = {
+        NIFTY: 22000,
+        BANKNIFTY: 47000,
+        FINNIFTY: 21000,
+        MIDCPNIFTY: 10500
+    };
+    const under = String(cfg.underlying || '').toUpperCase();
+    return defaults[under] || 22000;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -779,7 +804,7 @@ function _getPrecomputed(instruments, query) {
         : MCX_OPTION_UNDERLYINGS_DEFAULT.slice()
     ).filter((s) => MCX_ALLOWED_WATCHLIST.includes(s));
     const mcxOptSigForPrecompute = mcxOptSymQuery || MCX_OPTION_UNDERLYINGS_DEFAULT.join(',');
-    const mcxOptRange = parseInt(query.mcxOptRange) || 2000;
+    const mcxOptRange = parseInt(query.mcxOptRange) || 5000;
     const querySig = `${nseList || '__DEFAULT__'}_${WATCHLIST_CACHE_BUST}_nse${nseSymbols.length}_mcxopt_${mcxOptSigForPrecompute}`;
 
     if (_precomputed && _precomputedInstrTime === instrumentsCacheTime && _precomputedQuerySig === querySig) {
@@ -821,27 +846,76 @@ function _getPrecomputed(instruments, query) {
         nfoConfig.push({ underlying: u, step, idxKey, futKey, expiry: nearestOpt ? toYmd(nearestOpt.expiry) : null, range: nfoRange });
     }
 
-    // ── MCX precompute: find nearest FUT for each base ONCE ──
+    // ── MCX precompute: find up to 3 expiries per base (previous + current + next) ──
     const mcxFutBases = MCX_ALLOWED_WATCHLIST.map(canonicalMcxName);
 
-    // Build MCX FUT lookup ONCE (avoid scanning 100K instruments per base)
-    const mcxFutByBase = {}; // base → { tradingsymbol, expiry, fullKey }
+    // Include contracts expired up to 10 days ago (for "previous" expiry visibility)
+    const mcxPrevWindow = new Date(today.getTime() - 10 * 24 * 60 * 60 * 1000);
+    const mcxFutByBase = {}; // base → [{ tradingsymbol, expiry, fullKey }] up to 3
+
+    // ── DIAGNOSTIC: count MCX instruments ──
+    const _mcxAll = instruments.filter(i => i.exchange === 'MCX');
+    const _mcxFut = _mcxAll.filter(i => String(i.instrument_type || '').toUpperCase() === 'FUT');
+    const _mcxFutRecent = _mcxFut.filter(i => new Date(i.expiry || 0) >= mcxPrevWindow);
+    console.log(`🔍 MCX total=${_mcxAll.length} | FUT=${_mcxFut.length} | recent=${_mcxFutRecent.length} | sample=${_mcxFutRecent.slice(0,3).map(i=>i.tradingsymbol+'/'+i.expiry).join(', ')}`);
+    const _nfoAll = instruments.filter(i => i.exchange === 'NFO' && String(i.instrument_type||'').toUpperCase()==='FUT');
+    console.log(`🔍 NFO FUT=${_nfoAll.length} | sample=${_nfoAll.slice(0,3).map(i=>i.tradingsymbol).join(', ')}`);
+
     for (const inst of instruments) {
         if (inst.exchange !== 'MCX') continue;
         if (String(inst.instrument_type || '').toUpperCase() !== 'FUT') continue;
-        if (new Date(inst.expiry || 0) < today) continue;
+        if (new Date(inst.expiry || 0) < mcxPrevWindow) continue;
         for (const base of mcxFutBases) {
             if (isExactMcxFutureForBase(inst.tradingsymbol, base)) {
-                if (!mcxFutByBase[base] || new Date(inst.expiry) < new Date(mcxFutByBase[base].expiry)) {
-                    mcxFutByBase[base] = { tradingsymbol: inst.tradingsymbol, expiry: inst.expiry, fullKey: `MCX:${inst.tradingsymbol}` };
-                }
+                if (!mcxFutByBase[base]) mcxFutByBase[base] = [];
+                mcxFutByBase[base].push({ tradingsymbol: inst.tradingsymbol, expiry: inst.expiry, fullKey: `MCX:${inst.tradingsymbol}` });
             }
         }
     }
-
-    // Add MCX FUT keys to LTP fetch
+    // Sort each base ascending by expiry, keep at most 3 (previous + current + next)
     for (const base of mcxFutBases) {
-        if (mcxFutByBase[base]) ltpKeys.push(mcxFutByBase[base].fullKey);
+        if (mcxFutByBase[base]) {
+            mcxFutByBase[base] = mcxFutByBase[base]
+                .sort((a, b) => new Date(a.expiry) - new Date(b.expiry))
+                .slice(0, 3);
+        }
+    }
+
+    // ── DIAGNOSTIC: check mcxFutByBase result ──
+    const _matchedBases = Object.keys(mcxFutByBase);
+    console.log(`🔍 mcxFutByBase matched ${_matchedBases.length} bases: ${_matchedBases.join(', ')}`);
+    if (_matchedBases.length === 0) {
+        // Test regex against first sample manually
+        const _sample = _mcxFutRecent[0];
+        if (_sample) {
+            console.log(`🔍 Regex test for "${_sample.tradingsymbol}" vs bases: ${mcxFutBases.slice(0,5).map(b => `${b}=${isExactMcxFutureForBase(_sample.tradingsymbol,b)}`).join(', ')}`);
+        }
+    }
+
+    // Add MCX FUT keys to LTP fetch (all up to 3 per base)
+    for (const base of mcxFutBases) {
+        const contracts = mcxFutByBase[base] || [];
+        for (const f of contracts) ltpKeys.push(f.fullKey);
+    }
+
+    // ── NFO stock futures: nearest 1 expiry per stock across NIFTY50+BANKNIFTY+FINNIFTY+MIDCAP ──
+    const nfoFutIdx = indexedInstruments['NFO']?.FUT || [];
+    const nfoFutByName = {};
+    for (const inst of nfoFutIdx) {
+        const name = String(inst.name || '').toUpperCase();
+        const exp = new Date(inst.expiry || 0);
+        if (exp < today) continue;
+        if (!nfoFutByName[name] || exp < new Date(nfoFutByName[name].expiry)) nfoFutByName[name] = inst;
+    }
+    const nfoStockUniverse = ALL_NSE_STOCKS.length > 0 ? ALL_NSE_STOCKS : NIFTY50;
+    for (const stockSym of nfoStockUniverse) {
+        const inst = nfoFutByName[stockSym.toUpperCase()];
+        if (!inst) continue;
+        const fullKey = `NFO:${inst.tradingsymbol}`;
+        if (!nfoFutKeys.includes(fullKey)) {
+            nfoFutKeys.push(fullKey);
+            nfoFutMeta[fullKey] = { expiry: toYmd(inst.expiry) };
+        }
     }
 
     // Build NFO/MCX option instrument index ONCE (avoid scanning 100K per underlying)
@@ -887,6 +961,7 @@ async function _buildWatchlistData(query, userId) {
         throw new Error('Kite not connected');
     }
 
+    const today = new Date();
     const instruments = await getInstrumentsFromCache();
     const pc = _getPrecomputed(instruments, query);
 
@@ -926,34 +1001,72 @@ async function _buildWatchlistData(query, userId) {
         }
     }
 
-    // ── Step 3: MCX Futures keys ──
+    // ── Step 3: MCX Futures keys (up to 3 expiries: previous + current + next) ──
     const mcxFutKeys = [];
     const mcxFutMeta = {};
     for (const base of pc.mcxFutBases) {
-        const f = pc.mcxFutByBase[base];
-        if (!f) continue;
-        mcxFutKeys.push(f.fullKey);
-        mcxFutMeta[f.fullKey] = { expiry: toYmd(f.expiry) };
+        const contracts = pc.mcxFutByBase[base] || [];
+        for (const f of contracts) {
+            mcxFutKeys.push(f.fullKey);
+            mcxFutMeta[f.fullKey] = { expiry: toYmd(f.expiry) };
+        }
     }
 
-    // ── Step 4: MCX Options ──
+    // ── Step 4: MCX Options (ATM ±range filter, same as NFO options) ──
+    const mcxOptRangePts = pc.mcxOptRange || 5000;
     const mcxOptKeys = [];
     const mcxOptMeta = {};
     for (const reqName of pc.mcxOptRequested) {
         const base = canonicalMcxName(reqName);
         const step = MCX_ALLOWED[base]?.step || 10;
-        const fut = pc.mcxFutByBase[base];
+        const contracts = pc.mcxFutByBase[base] || [];
+        const fut = contracts.find(f => new Date(f.expiry) >= today) || contracts[0];
         if (!fut) continue;
-        const ltp = ltpQuotes?.[fut.fullKey]?.last_price || 0;
+        if (!global.LAST_KNOWN_LTPS) {
+            global.LAST_KNOWN_LTPS = {};
+        }
+        let ltp = ltpQuotes?.[fut.fullKey]?.last_price || 0;
+        const cacheKey = base;
+        if (ltp > 0) {
+            global.LAST_KNOWN_LTPS[cacheKey] = ltp;
+            global.LAST_KNOWN_LTPS[fut.fullKey] = ltp;
+        } else {
+            ltp = global.LAST_KNOWN_LTPS[cacheKey] || global.LAST_KNOWN_LTPS[fut.fullKey] || 0;
+            if (!ltp) {
+                const mcxDefaults = {
+                    CRUDEOIL: 6500,
+                    CRUDEOILM: 6500,
+                    MCRUDEOIL: 6500,
+                    NATURALGAS: 200,
+                    NATURALGASMINI: 200,
+                    MNATURALGAS: 200,
+                    GOLD: 72000,
+                    GOLDM: 72000,
+                    MGOLD: 72000,
+                    SILVER: 85000,
+                    SILVERM: 85000,
+                    MSILVER: 85000
+                };
+                ltp = mcxDefaults[base] || 1000;
+            }
+        }
         const nearestOpt = pickNearestExpiry(instruments, { exchange: 'MCX', name: base, instrumentTypes: ['CE', 'PE'] });
         if (!nearestOpt) continue;
         const expiryYmd = toYmd(nearestOpt.expiry);
         if (!expiryYmd) continue;
         const requestedExpiry = new Date(expiryYmd).toDateString();
+
+        // Build ATM strike range
+        const lowerBound = Math.floor((ltp - mcxOptRangePts) / step) * step;
+        const upperBound = Math.ceil((ltp + mcxOptRangePts) / step) * step;
+        const strikeSet = new Set();
+        for (let s = lowerBound; s <= upperBound; s += step) strikeSet.add(s);
+
         const optList = pc.mcxOptIndex[base] || [];
         for (const inst of optList) {
             if (new Date(inst.expiry || 0).toDateString() !== requestedExpiry) continue;
             const strike = Number(inst.strike);
+            if (!strikeSet.has(strike)) continue; // outside ATM ±range
             const fullKey = `MCX:${inst.tradingsymbol}`;
             const it = String(inst.instrument_type || '').toUpperCase();
             mcxOptKeys.push(fullKey);
@@ -1006,6 +1119,15 @@ async function _buildWatchlistData(query, userId) {
 
     // ── Step 7: Gather Contract Management Exclusions (Visibility decided by frontend) ──
     const excluded = global.EXCLUDED_CONTRACTS || [];
+
+    // ── DIAGNOSTIC: log row counts ──
+    const _nseCnt = rows.filter(r => r.type === 'NSE').length;
+    const _nfoFutCnt = rows.filter(r => r.type === 'FUT').length;
+    const _nfoOptCnt = rows.filter(r => r.type === 'NFO_OPT').length;
+    const _mcxFutCnt = rows.filter(r => r.type === 'MCX_FUT').length;
+    const _mcxOptCnt = rows.filter(r => r.type === 'MCX_OPT').length;
+    console.log(`🔍 _buildWatchlistData rows: NSE=${_nseCnt} NFO_FUT=${_nfoFutCnt} NFO_OPT=${_nfoOptCnt} MCX_FUT=${_mcxFutCnt} MCX_OPT=${_mcxOptCnt} mcxFutKeys=${mcxFutKeys.length} nfoFutKeys=${pc.nfoFutKeys.length} total=${rows.length}`);
+    if (mcxFutKeys.length === 0) console.log(`🔍 mcxFutByBase keys: ${Object.keys(pc.mcxFutByBase).join(', ')}`);
 
     // ── Step 8: Push via WebSocket ──
     const io = require('../websocket/SocketManager').getIo();
@@ -1335,11 +1457,46 @@ async function fetchFreshQuotes(symbols) {
 }
 
 function resolveNfoIndexSpotLtp(ltpQuotes, cfg) {
-    if (!ltpQuotes || !cfg) return 0;
-    const spot = ltpQuotes[cfg.idxKey]?.last_price || 0;
-    if (spot > 0) return spot;
-    const fut = ltpQuotes[cfg.futKey]?.last_price || 0;
-    return fut;
+    if (!cfg) return 0;
+    if (!global.LAST_KNOWN_LTPS) {
+        global.LAST_KNOWN_LTPS = {};
+    }
+    const fromQuote = (key) => {
+        if (!key || !ltpQuotes || !ltpQuotes[key]) return 0;
+        const q = ltpQuotes[key];
+        const lp = Number(q.last_price);
+        if (Number.isFinite(lp) && lp > 0) return lp;
+        const oc = Number(q.ohlc?.close);
+        if (Number.isFinite(oc) && oc > 0) return oc;
+        const av = Number(q.average_price);
+        if (Number.isFinite(av) && av > 0) return av;
+        return 0;
+    };
+    let ltp = fromQuote(cfg.idxKey);
+    if (!ltp && cfg.futKey) {
+        ltp = fromQuote(cfg.futKey);
+    }
+    const cacheKey = cfg.underlying || cfg.idxKey;
+    if (ltp > 0) {
+        global.LAST_KNOWN_LTPS[cacheKey] = ltp;
+        if (cfg.idxKey) global.LAST_KNOWN_LTPS[cfg.idxKey] = ltp;
+        if (cfg.futKey) global.LAST_KNOWN_LTPS[cfg.futKey] = ltp;
+        return ltp;
+    }
+    if (global.LAST_KNOWN_LTPS[cacheKey] && global.LAST_KNOWN_LTPS[cacheKey] > 0) {
+        return global.LAST_KNOWN_LTPS[cacheKey];
+    }
+    if (cfg.idxKey && global.LAST_KNOWN_LTPS[cfg.idxKey] && global.LAST_KNOWN_LTPS[cfg.idxKey] > 0) {
+        return global.LAST_KNOWN_LTPS[cfg.idxKey];
+    }
+    const defaults = {
+        NIFTY: 22000,
+        BANKNIFTY: 47000,
+        FINNIFTY: 21000,
+        MIDCPNIFTY: 10500
+    };
+    const under = String(cfg.underlying || '').toUpperCase();
+    return defaults[under] || 22000;
 }
 
 // Helper: format a quote into clean object
@@ -1942,6 +2099,20 @@ router.post('/ticker/reconnect', authMiddleware, asyncHandler(async (req, res) =
  */
 async function fetchUnifiedWatchlistForSocket(userId, query = {}) {
     try {
+        // If global session is gone, try to restore from per-user DB (same as buildKiteDashboardPayload)
+        if (!kiteService.isAuthenticated() && userId) {
+            try {
+                const status = await kiteAuthService.getStatus(userId);
+                if (status.connected) {
+                    const session = await require('../repositories/KiteRepository').getSessionByUserId(userId);
+                    if (session?.access_token) {
+                        kiteService.accessToken = session.access_token;
+                        kiteService.sessionData = { access_token: session.access_token, user_name: session.user_name };
+                    }
+                }
+            } catch (_) { }
+        }
+
         if (!kiteService.isAuthenticated()) {
             return { ok: false, kite_disconnected: true, data: [], error: 'Kite not connected.' };
         }
@@ -1950,13 +2121,16 @@ async function fetchUnifiedWatchlistForSocket(userId, query = {}) {
         const cacheKey = `${query.nse || ''}_${query.nfoUnderlyings || ''}_${query.mcxOptSymbols || ''}_${query.nfoIndexOptRange || ''}_${WATCHLIST_CACHE_BUST}_v${configVer}`;
 
         if (watchlistCache.data && watchlistCache.key === cacheKey) {
+            console.log(`🔍 fetchUnifiedWatchlistForSocket: CACHE HIT (${watchlistCache.data.length} rows)`);
             watchlistLastQuery = query;
             watchlistLastUserId = userId;
             startWatchlistAutoRefresh();
             return { ok: true, data: watchlistCache.data };
         }
 
+        console.log(`🔍 fetchUnifiedWatchlistForSocket: CACHE MISS — building fresh (cacheKey="${cacheKey}")`);
         const rows = await _buildWatchlistData(query, userId);
+        console.log(`🔍 fetchUnifiedWatchlistForSocket: built ${rows.length} rows`);
         watchlistCache = { data: rows, time: Date.now(), key: cacheKey };
         watchlistLastQuery = query;
         watchlistLastUserId = userId;

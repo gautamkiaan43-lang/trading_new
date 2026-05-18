@@ -140,12 +140,3 @@ class RMSService {
 }
 
 module.exports = new RMSService();
-stop() {
-    if (this.interval) {
-        clearInterval(this.interval);
-        this.interval = null;
-    }
-}
-}
-
-module.exports = new RMSService();

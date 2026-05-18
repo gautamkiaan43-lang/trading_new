@@ -145,17 +145,9 @@ const getClientLiveM2M = async (req, res) => {
             const symTrimmed = symbol.split(':').pop().toUpperCase().replace(/\d+.*/, '');
             if (MCX_LOT_SIZES[symTrimmed]) return MCX_LOT_SIZES[symTrimmed];
 
-            // 3. Try User Specific Config (Only if hardcoded not found)
-            if (userConfig && typeof userConfig === 'object') {
-                const mcxLotMargins = userConfig.mcxLotMargins;
-                if (mcxLotMargins) {
-                    const configLot = mcxLotMargins[symbol] || mcxLotMargins[base] || mcxLotMargins[symTrimmed];
-                    if (configLot && typeof configLot === 'object' && configLot.LOT) {
-                        const lot = parseFloat(configLot.LOT);
-                        if (lot > 0) return lot;
-                    }
-                }
-            }
+            // NOTE: mcxLotMargins[scrip].LOT is the per-user position LIMIT (max lots allowed),
+            // NOT the exchange lot size. It must never be used as a P&L/turnover multiplier.
+            // Skipping that fallback intentionally.
 
             // 4. Try Scrip Data Table (Fallback)
             const cleanSym = symbol.includes(':') ? symbol.split(':')[1] : symbol;

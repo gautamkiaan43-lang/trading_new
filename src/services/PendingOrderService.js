@@ -75,7 +75,7 @@ const monitorPendingOrders = async () => {
                     if (io) {
                         // Notify user about execution
                         io.to(`user:${trade.user_id}`).emit('notification', {
-                            message: `Order Executed! ${trade.type} ${trade.symbol} at ₹${currentPrice}`,
+                            message: `Pending ${trade.type} order for ${cleanSymbol} executed successfully at ₹${currentPrice}`,
                             type: 'ORDER_EXECUTED',
                             tradeId: trade.id
                         });

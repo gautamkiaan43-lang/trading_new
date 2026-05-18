@@ -60,12 +60,13 @@ class KiteController {
             const session = await kiteService.handleCallback(request_token);
             const accessToken = session.access_token || '';
 
-            // Also save to per-user DB if userId was passed via state param
+            // Save the already-obtained session to per-user DB
+            // (request_token is already consumed above; don't call generateSession again)
             if (userId) {
                 try {
-                    await kiteAuthService.handleCallback(userId, request_token);
+                    await kiteAuthService.saveTokenToDB(userId, accessToken, session);
                 } catch (dbErr) {
-                    // Per-user save may fail if request_token already used, that's OK — global is set
+                    console.error('[Kite Callback] DB session save failed:', dbErr.message);
                 }
             }
 
@@ -223,11 +224,17 @@ class KiteController {
             try {
                 profile = await kiteService.setAccessToken(access_token);
             } catch (validationErr) {
-                return res.status(400).json({ error: 'Invalid access token. Please check and try again.' });
+                // Show actual Kite rejection reason, not a generic message
+                const reason = validationErr.message || 'Token rejected by Zerodha';
+                return res.status(400).json({ error: `Invalid access token: ${reason}` });
             }
 
-            // Token is valid — save to per-user DB (skip re-validation)
-            await kiteAuthService.saveTokenToDB(userId, access_token, profile);
+            // Token is valid — save to per-user DB (DB failure must not block the response)
+            try {
+                await kiteAuthService.saveTokenToDB(userId, access_token, profile);
+            } catch (dbErr) {
+                console.error('[setToken] DB save failed:', dbErr.message);
+            }
 
             // Trigger instruments sync in background (don't block response)
             setImmediate(async () => {
@@ -288,8 +295,6 @@ class KiteController {
 
             res.json({ success: true, message: 'Access token set successfully', user: profile?.user_name || null });
         } catch (err) {
-            // Clear everything on failure
-            kiteService.clearSession();
             res.status(500).json({ error: err.message });
         }
     }

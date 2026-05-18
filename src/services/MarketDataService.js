@@ -352,13 +352,17 @@ class MarketDataService extends EventEmitter {
     // ══════════════════════════════════════════════════════
 
     async startCryptoForex() {
-        console.log('🌐 Starting AllTick (Forex + Crypto) feeds');
+        console.log('🌐 Starting Forex + Crypto feeds');
         allTicksService.start();
+        const fastforexService = require('./fastforex.service');
+        fastforexService.start();
     }
 
     stopCryptoForex() {
         allTicksService.stop();
-        console.log('🛑 Stopped AllTick Integration');
+        const fastforexService = require('./fastforex.service');
+        fastforexService.stop();
+        console.log('🛑 Stopped Forex + Crypto feeds');
     }
 
     getPrice(symbol) {
@@ -375,13 +379,23 @@ class MarketDataService extends EventEmitter {
     }
 
     getCryptoPrices() {
-        if (!CRYPTO_SYMBOLS_LIST) return [];
-        return CRYPTO_SYMBOLS_LIST.map(sym => this.prices[`CRYPTO:${sym}`]).filter(Boolean);
+        if (CRYPTO_SYMBOLS_LIST && CRYPTO_SYMBOLS_LIST.length > 0) {
+            return CRYPTO_SYMBOLS_LIST.map(sym => this.prices[`CRYPTO:${sym}`]).filter(Boolean);
+        }
+        // Fallback: scan prices — keep only slashed symbols to avoid unslashed duplicates
+        return Object.values(this.prices).filter(p =>
+            p?.symbol?.startsWith('CRYPTO:') && p.symbol.includes('/')
+        );
     }
 
     getForexPrices() {
-        if (!FOREX_SYMBOLS_LIST) return [];
-        return FOREX_SYMBOLS_LIST.map(sym => this.prices[`FOREX:${sym}`]).filter(Boolean);
+        if (FOREX_SYMBOLS_LIST && FOREX_SYMBOLS_LIST.length > 0) {
+            return FOREX_SYMBOLS_LIST.map(sym => this.prices[`FOREX:${sym}`]).filter(Boolean);
+        }
+        // Fallback: scan prices — keep only slashed symbols to avoid unslashed duplicates
+        return Object.values(this.prices).filter(p =>
+            p?.symbol?.startsWith('FOREX:') && p.symbol.includes('/')
+        );
     }
 
     getBinanceError() {

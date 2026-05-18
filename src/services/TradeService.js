@@ -5,6 +5,61 @@ const { invalidateCache } = require('../utils/cacheManager');
 const kiteService = require('../utils/kiteService');
 const { getLotSize } = require('../utils/symbolHelper');
 
+const syncPaperPosition = async (userId, symbol, connection = db) => {
+    try {
+        console.log(`[syncPaperPosition] Syncing paper position (Service) for user ${userId}, symbol ${symbol}`);
+        const [trades] = await connection.execute(
+            "SELECT type, qty, entry_price FROM trades WHERE user_id = ? AND symbol = ? AND status = 'OPEN' AND is_pending = 0",
+            [userId, symbol]
+        );
+
+        let totalBuyQty = 0;
+        let totalBuyCost = 0;
+        let totalSellQty = 0;
+        let totalSellCost = 0;
+
+        for (const trade of trades) {
+            const qty = parseFloat(trade.qty);
+            const entryPrice = parseFloat(trade.entry_price);
+            if (trade.type.toUpperCase() === 'BUY') {
+                totalBuyQty += qty;
+                totalBuyCost += qty * entryPrice;
+            } else if (trade.type.toUpperCase() === 'SELL') {
+                totalSellQty += qty;
+                totalSellCost += qty * entryPrice;
+            }
+        }
+
+        const netQty = totalBuyQty - totalSellQty;
+        let avgPrice = 0;
+        if (netQty > 0) {
+            avgPrice = totalBuyQty > 0 ? (totalBuyCost / totalBuyQty) : 0;
+        } else if (netQty < 0) {
+            avgPrice = totalSellQty > 0 ? (totalSellCost / totalSellQty) : 0;
+        }
+
+        if (netQty === 0) {
+            // Delete position if closed
+            await connection.execute(
+                "DELETE FROM paper_positions WHERE user_id = ? AND symbol = ?",
+                [userId, symbol]
+            );
+            console.log(`[syncPaperPosition] Deleted paper position (netQty = 0)`);
+        } else {
+            // Insert or update position
+            await connection.execute(
+                `INSERT INTO paper_positions (user_id, symbol, quantity, avg_price)
+                 VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE quantity = ?, avg_price = ?, updated_at = CURRENT_TIMESTAMP`,
+                [userId, symbol, netQty, avgPrice, netQty, avgPrice]
+            );
+            console.log(`[syncPaperPosition] Synced paper position: quantity = ${netQty}, avg_price = ${avgPrice}`);
+        }
+    } catch (err) {
+        console.error(`[syncPaperPosition] Error syncing paper position:`, err.message);
+    }
+};
+
 /**
  * Service to handle core Trade operations like closing and auto-squaring off.
  */
@@ -69,18 +124,6 @@ class TradeService {
                     lotSize = MCX_LOT_SIZES[symTrimmed];
                 }
 
-                // 2. Try User Specific Override from client_settings
-                if (clientConfig && typeof clientConfig === 'object' && clientConfig.mcxLotMargins) {
-                    const overrides = clientConfig.mcxLotMargins;
-                    const configLot = overrides[trade.symbol] || overrides[base] || overrides[symTrimmed];
-                    if (configLot && typeof configLot === 'object' && configLot.LOT) {
-                        const customLot = parseFloat(configLot.LOT);
-                        if (customLot > 0) {
-                            lotSize = customLot;
-                            console.log(`[TradeService] Using User-Specific MCX Lot Size: ${lotSize}`);
-                        }
-                    }
-                }
                 console.log(`[TradeService] Final MCX Lot Size: ${trade.symbol} → ${lotSize}`);
             }
             else if (mType === 'EQUITY' || mType === 'NSE' || mType === 'NFO' || mType === 'OPTIONS') {
@@ -127,8 +170,20 @@ class TradeService {
                         const quoteRes = await kiteService.getQuote(kiteSym);
                         const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
                         if (quote && quote.last_price > 0) {
-                            finalExitPrice = quote.last_price;
-                            console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice}`);
+                            let bid = quote.depth?.buy?.[0]?.price;
+                            let ask = quote.depth?.sell?.[0]?.price;
+                            
+                            if (!bid || bid <= 0) bid = quote.last_price;
+                            if (!ask || ask <= 0) ask = quote.last_price;
+
+                            finalExitPrice = trade.type === 'BUY' ? bid : ask;
+                            
+                            // If it still evaluates to 0, use last_price
+                            if (!finalExitPrice || finalExitPrice <= 0) {
+                                finalExitPrice = quote.last_price;
+                            }
+                            
+                            console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice} (LTP: ${quote.last_price}, Bid: ${bid}, Ask: ${ask})`);
                         }
                     } catch (e) {
                         console.warn(`[TradeService] Kite Quote Fallback triggered:`, e.message);
@@ -145,8 +200,10 @@ class TradeService {
                     }
 
                     if (liveData) {
-                        finalExitPrice = liveData.ltp || (trade.type === 'BUY' ? liveData.bid : liveData.ask);
-                        console.log(`[TradeService] Found in Ticker: ${finalExitPrice}`);
+                        let bid = liveData.bid > 0 ? liveData.bid : liveData.ltp;
+                        let ask = liveData.ask > 0 ? liveData.ask : liveData.ltp;
+                        finalExitPrice = trade.type === 'BUY' ? bid : ask;
+                        console.log(`[TradeService] Found in Ticker: ${finalExitPrice} (LTP: ${liveData.ltp}, Bid: ${bid}, Ask: ${ask})`);
                     }
                 }
 
@@ -348,6 +405,8 @@ class TradeService {
                 'UPDATE users SET balance = balance + ? WHERE id = ?',
                 [balanceChange, trade.user_id]
             );
+
+            await syncPaperPosition(trade.user_id, trade.symbol, connection);
 
             await connection.commit();
 
