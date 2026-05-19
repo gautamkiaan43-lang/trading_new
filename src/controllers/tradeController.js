@@ -1238,6 +1238,8 @@ const placeOrder = async (req, res) => {
         // Get leverage from request body or client config (default 5x)
         let leverageUsed = parseFloat(req.body.leverage_used) ||
             parseFloat(clientConfig?.holding_leverage) || 5;
+        // Ensure leverage_used is within valid range (1-10)
+        leverageUsed = Math.max(1, Math.min(10, leverageUsed));
 
         // Instrument Classification: NSE EQUITY vs Derivatives vs MCX
         const isNseEquity = marketType === 'EQUITY' || (marketType === 'NSE' && instrumentType === 'EQ');
