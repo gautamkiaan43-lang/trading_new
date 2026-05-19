@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const kiteService = require('../utils/kiteService');
+const db = require('../config/db');
 
 const EXCLUDED_FILE = path.join(__dirname, '../data/excluded_contracts.json');
 const CONTRACTS_CACHE_FILE = path.join(__dirname, '../data/contracts_cache.json');
@@ -129,6 +130,29 @@ async function getAllContractsFromKite() {
 
 loadExcludedContracts();
 
+// ─── Live NFO bases from DB (mirrors kiteRoutes ALL_NSE_STOCKS + NFO_INDICES) ───
+let _liveNfoBases = null; // Set<UPPERCASE symbol>
+
+async function _loadLiveNfoBases() {
+    try {
+        const [rows] = await db.execute(`
+            SELECT mg.name AS group_name, mgi.symbol
+            FROM market_group_items mgi
+            JOIN market_groups mg ON mgi.group_id = mg.id
+            WHERE mg.is_active = 1
+              AND mg.name IN ('NIFTY 50','BANK NIFTY','MIDCAP SELECT','FIN NIFTY','NFO INDICES')
+        `);
+        const all = rows.map(r => String(r.symbol || '').trim().toUpperCase()).filter(Boolean);
+        _liveNfoBases = new Set(all);
+        console.log(`[contractController] Live NFO bases loaded: ${_liveNfoBases.size}`);
+    } catch (err) {
+        console.warn('[contractController] Could not load NFO bases from DB:', err.message);
+        _liveNfoBases = new Set(NFO_WATCH_BASES.map(s => s.toUpperCase()));
+    }
+}
+_loadLiveNfoBases();
+setInterval(_loadLiveNfoBases, 5 * 60 * 1000); // refresh every 5 min
+
 // Returns array of excluded symbols
 function getExcludedSymbols() {
     return excludedContracts.slice();
@@ -193,10 +217,13 @@ exports.saveContractSelection = async (req, res) => {
         if (!Array.isArray(contracts)) {
             return res.status(400).json({ error: 'contracts must be an array' });
         }
-        const allContracts = await getAllContractsFromKite();
-        const allSymbols = allContracts.map(c => c.symbol);
+        // Use same pool as Contract Management display (FUT + CE + PE), so excluded
+        // list only ever contains symbols the admin actually saw and unchecked.
+        const instruments = await kiteService.getInstruments();
+        const allDisplayed = getMarketWatchContracts(instruments);
+        const allSymbols = allDisplayed.map(c => c.symbol);
 
-        // Excluded = All - Selected
+        // Excluded = displayed but not selected
         const excluded = allSymbols.filter(sym => !contracts.includes(sym));
         excludedContracts = excluded;
         global.EXCLUDED_CONTRACTS = excluded;
@@ -497,25 +524,16 @@ function getMarketWatchContracts(instruments) {
 
     // Major option parameters
     const OPTION_STEPS = {
-        NIFTY: 50,
-        BANKNIFTY: 100,
-        FINNIFTY: 50,
-        MIDCPNIFTY: 50,
-        CRUDEOIL: 100,
-        NATURALGAS: 5,
-        GOLD: 100,
-        SILVER: 250
+        NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 50,
+        CRUDEOIL: 100, NATURALGAS: 5, GOLD: 100, SILVER: 250,
+        GOLDM: 10, SILVERM: 100, CRUDEOILM: 10, NATURALGASMINI: 1
     };
 
+    // Realistic fallback prices (used only when live price unavailable)
     const OPTION_DEFAULTS = {
-        NIFTY: 22500,
-        BANKNIFTY: 48000,
-        FINNIFTY: 21500,
-        MIDCPNIFTY: 11000,
-        CRUDEOIL: 6500,
-        NATURALGAS: 160,
-        GOLD: 72000,
-        SILVER: 82000
+        NIFTY: 24000, BANKNIFTY: 52000, FINNIFTY: 23000, MIDCPNIFTY: 12000,
+        CRUDEOIL: 6500, NATURALGAS: 300, GOLD: 93000, SILVER: 95000,
+        GOLDM: 93000, SILVERM: 95000, CRUDEOILM: 6500, NATURALGASMINI: 300
     };
 
     // Cache live prices if available from MarketDataService
@@ -523,6 +541,25 @@ function getMarketWatchContracts(instruments) {
     try {
         marketDataService = require('../services/MarketDataService');
     } catch (_) {}
+
+    // Pre-build MCX nearest FUT key map from instruments (avoids stale MCX:GOLDFUT key)
+    const mcxNearestFutKey = {};
+    const _now = new Date();
+    for (const instr of instruments) {
+        if (instr.exchange !== 'MCX') continue;
+        if (String(instr.instrument_type || '').toUpperCase() !== 'FUT') continue;
+        if (new Date(instr.expiry || 0) < _now) continue;
+        const baseName = String(instr.name || '').toUpperCase();
+        if (!mcxNearestFutKey[baseName]) {
+            mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
+        } else {
+            // keep nearest expiry
+            const existing = instruments.find(i => `MCX:${i.tradingsymbol}` === mcxNearestFutKey[baseName]);
+            if (existing && new Date(instr.expiry) < new Date(existing.expiry)) {
+                mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
+            }
+        }
+    }
 
     const getLtp = (underlying) => {
         const defaults = OPTION_DEFAULTS[underlying] || 500;
@@ -533,7 +570,7 @@ function getMarketWatchContracts(instruments) {
                 else if (underlying === 'BANKNIFTY') key = 'NSE:NIFTY BANK';
                 else if (underlying === 'FINNIFTY') key = 'NSE:NIFTY FIN SERVICE';
                 else if (underlying === 'MIDCPNIFTY') key = 'NSE:NIFTY MID SELECT';
-                else key = `MCX:${underlying}FUT`;
+                else key = mcxNearestFutKey[underlying] || `MCX:${underlying}FUT`;
 
                 const priceObj = marketDataService.getPrice(key) || marketDataService.getPrice(underlying);
                 if (priceObj && priceObj.ltp > 0) return priceObj.ltp;
@@ -544,7 +581,10 @@ function getMarketWatchContracts(instruments) {
 
     // Build sets of known bases for fast lookup
     const mcxBaseSet = new Set(MCX_WATCH_BASES.map(b => b.toUpperCase()));
-    const nfoBaseSet = new Set(NFO_WATCH_BASES.map(b => b.toUpperCase()));
+    // Use live NFO bases from DB if available, else fall back to static list
+    const nfoBaseSet = (_liveNfoBases && _liveNfoBases.size > 0)
+        ? _liveNfoBases
+        : new Set(NFO_WATCH_BASES.map(b => b.toUpperCase()));
 
     // Group unique expiries per exchange + base name + type to restrict option expiries
     const uniqueExpiriesMap = {};
@@ -593,7 +633,7 @@ function getMarketWatchContracts(instruments) {
 
         // NFO: Futures & Options for index/stock bases
         if (ex === 'NFO') {
-            const isWatchBase = nfoBaseSet.has(baseName) || NFO_WATCH_BASES.some(b => sym.startsWith(b.toUpperCase()));
+            const isWatchBase = nfoBaseSet.has(baseName);
             if (isWatchBase && (type === 'FUT' || type === 'CE' || type === 'PE')) {
                 included = true;
             }
@@ -606,23 +646,22 @@ function getMarketWatchContracts(instruments) {
 
         if (!included) return;
 
-        // Strict Filter for Options to prevent lag (limit to nearest 2 expiries + ATM ±5 strikes)
+        // Filter Options: nearest 2 expiries + ATM ±10 strikes
         if (type === 'CE' || type === 'PE') {
-            // Limit options only to major underlyings
             const step = OPTION_STEPS[baseName];
-            if (!step) return; // skip non-major options (e.g. stock options)
+            if (!step) return; // skip non-configured underlyings
 
-            // Limit to nearest 2 active expiries
+            // Nearest 2 active expiries only
             const expKey = `${ex}:${baseName}:${type}`;
             const expList = uniqueExpiriesMap[expKey] || [];
             const allowedExpiries = expList.slice(0, 2);
             if (!allowedExpiries.includes(instr.expiry)) return;
 
-            // Limit to ATM ± 5 strikes
+            // ATM ± 10 strikes (wider range covers live price fluctuations)
             const ltp = getLtp(baseName);
             const atm = Math.round(ltp / step) * step;
             const strikeNum = Number(instr.strike);
-            const maxRange = step * 5;
+            const maxRange = step * 10;
             if (Math.abs(strikeNum - atm) > maxRange) return;
         }
 
@@ -666,6 +705,99 @@ exports.getMarketWatchExpiries = async (req, res) => {
 
         const instruments = await kiteService.getInstruments();
         const contracts = getMarketWatchContracts(instruments);
+
+        // Auto-exclude MCX FUT contracts beyond position 3 per base (4th, 5th, 6th expiry).
+        // Near-month (1st-3rd) stay enabled by default. Admin can override anytime.
+        const mcxFutPerBase = {};
+        for (const c of contracts) {
+            if (c.segment === 'MCX' && c.instrument_type === 'FUT') {
+                if (!mcxFutPerBase[c.name]) mcxFutPerBase[c.name] = [];
+                mcxFutPerBase[c.name].push(c);
+            }
+        }
+        let changed = false;
+        for (const baseContracts of Object.values(mcxFutPerBase)) {
+            baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+            baseContracts.forEach((c, idx) => {
+                if (idx >= 3 && !excludedContracts.includes(c.symbol)) {
+                    excludedContracts.push(c.symbol);
+                    changed = true;
+                }
+            });
+        }
+
+        // Auto-exclude NFO FUT beyond nearest 1 expiry per base (same as MCX logic).
+        // Live market uses only 1 expiry per stock/index; 2nd+ are disabled by default.
+        const nfoFutPerBase = {};
+        for (const c of contracts) {
+            if (c.segment === 'NFO' && c.instrument_type === 'FUT') {
+                if (!nfoFutPerBase[c.name]) nfoFutPerBase[c.name] = [];
+                nfoFutPerBase[c.name].push(c);
+            }
+        }
+        for (const baseContracts of Object.values(nfoFutPerBase)) {
+            baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+            baseContracts.forEach((c, idx) => {
+                if (idx >= 1 && !excludedContracts.includes(c.symbol)) {
+                    excludedContracts.push(c.symbol);
+                    changed = true;
+                }
+            });
+        }
+
+        // Auto-exclude MCX CE/PE options beyond nearest 1 expiry per underlying.
+        // Live market shows only 1 expiry by default; 2nd+ disabled. Admin can enable any.
+        const mcxOptByUnderlying = {};
+        for (const c of contracts) {
+            if (c.segment === 'MCX' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
+                if (!mcxOptByUnderlying[c.name]) mcxOptByUnderlying[c.name] = {};
+                if (!mcxOptByUnderlying[c.name][c.expiry]) mcxOptByUnderlying[c.name][c.expiry] = [];
+                mcxOptByUnderlying[c.name][c.expiry].push(c);
+            }
+        }
+        for (const expiryMap of Object.values(mcxOptByUnderlying)) {
+            const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
+            sortedExpiries.forEach((expiry, idx) => {
+                if (idx >= 1) {
+                    expiryMap[expiry].forEach(c => {
+                        if (!excludedContracts.includes(c.symbol)) {
+                            excludedContracts.push(c.symbol);
+                            changed = true;
+                        }
+                    });
+                }
+            });
+        }
+
+        // Auto-exclude NFO CE/PE options beyond nearest 1 expiry per underlying.
+        const nfoOptByUnderlying = {};
+        for (const c of contracts) {
+            if (c.segment === 'NFO' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
+                if (!nfoOptByUnderlying[c.name]) nfoOptByUnderlying[c.name] = {};
+                if (!nfoOptByUnderlying[c.name][c.expiry]) nfoOptByUnderlying[c.name][c.expiry] = [];
+                nfoOptByUnderlying[c.name][c.expiry].push(c);
+            }
+        }
+        for (const expiryMap of Object.values(nfoOptByUnderlying)) {
+            const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
+            sortedExpiries.forEach((expiry, idx) => {
+                if (idx >= 1) {
+                    expiryMap[expiry].forEach(c => {
+                        if (!excludedContracts.includes(c.symbol)) {
+                            excludedContracts.push(c.symbol);
+                            changed = true;
+                        }
+                    });
+                }
+            });
+        }
+
+        if (changed) {
+            global.EXCLUDED_CONTRACTS = excludedContracts;
+            fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(excludedContracts, null, 2));
+        }
+        // Re-apply isSelected with updated excluded list
+        contracts.forEach(c => { c.isSelected = !excludedContracts.includes(c.symbol); });
 
         res.json({
             status: 'success',

@@ -241,7 +241,7 @@ const getClientLiveM2M = async (req, res) => {
 
 
 
-            if (trade.status === 'OPEN') {
+            if (trade.status === 'OPEN' && !trade.is_pending) {
                 stats.activeUsers[segment].add(trade.user_id);
                 if (isBuy) stats.activeBuy[segment] += 1;
                 else stats.activeSell[segment] += 1;
@@ -287,7 +287,7 @@ const getClientLiveM2M = async (req, res) => {
                 if (!clientMap[trade.user_id]) {
                     clientMap[trade.user_id] = {
                         id: trade.user_id, username: trade.username,
-                        activePL: 0, activeTrades: 0, margin: 0, balance: parseFloat(trade.balance || 0)
+                        activePL: 0, activeTrades: 0, margin: 0, marginUsed: 0, balance: parseFloat(trade.balance || 0)
                     };
                 }
                 clientMap[trade.user_id].activePL += unrealizedPnl;
@@ -347,6 +347,7 @@ const getClientLiveM2M = async (req, res) => {
                 }
 
                 clientMap[trade.user_id].margin += dynamicMargin;
+                clientMap[trade.user_id].marginUsed += parseFloat(trade.margin_used || 0);
             }
         });
 
@@ -394,6 +395,7 @@ const getClientLiveM2M = async (req, res) => {
                 m2m: netCapital.toFixed(2),
                 activePL: c.activePL.toFixed(2),
                 margin: c.margin.toFixed(2),
+                marginUsed: (c.marginUsed || 0).toFixed(2),
                 marginShortfall: shortfall.toFixed(2),
                 positions
             };

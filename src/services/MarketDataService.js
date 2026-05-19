@@ -158,29 +158,29 @@ class MarketDataService extends EventEmitter {
 
             // 3. Clean up previous ticker if any
             if (this.ticker) {
-                try { 
+                try {
                     this.ticker.removeAllListeners();
-                    this.ticker.disconnect(); 
+                    this.ticker.disconnect();
                 } catch (e) { }
                 this.ticker = null;
             }
 
             this.currentToken = activeToken;
             console.log(`🔌 Initializing KiteTicker with token: ${activeToken.substring(0, 6)}...`);
-            
+
             const currentTicker = new KiteTicker({
                 api_key: process.env.KITE_API_KEY,
                 access_token: activeToken
             });
 
             this.ticker = currentTicker;
-            currentTicker.autoReconnect(true, 20, 5); 
+            currentTicker.autoReconnect(true, 20, 5);
 
             let errorOccurred = false;
 
             currentTicker.on('connect', () => {
                 console.log('✅ Zerodha Ticker Connected');
-                
+
                 const INDEX_TOKENS = [
                     { token: 256265, symbol: 'NSE:NIFTY 50' },
                     { token: 260105, symbol: 'NSE:NIFTY BANK' },
@@ -242,7 +242,7 @@ class MarketDataService extends EventEmitter {
             try {
                 currentTicker.connect();
                 await new Promise((resolve) => {
-                    const timeout = setTimeout(() => {
+                    setTimeout(() => {
                         if (!currentTicker.connected) {
                             console.error('⏱️ Zerodha Ticker connection timeout');
                         }
@@ -352,16 +352,30 @@ class MarketDataService extends EventEmitter {
     // ══════════════════════════════════════════════════════
 
     async startCryptoForex() {
-        console.log('🌐 Starting Forex + Crypto feeds');
+        console.log('🌐 Starting Forex + Crypto feeds via AllTick');
         allTicksService.start();
-        const fastforexService = require('./fastforex.service');
-        fastforexService.start();
+        this._startCryptoForexPush();
+    }
+
+    // Push full crypto + forex lists to all socket clients every 5s.
+    // This fills the frontend even when the initial snapshot was empty
+    // (AllTick hadn't delivered any ticks yet at snapshot time).
+    _startCryptoForexPush() {
+        if (this._cfPushTimer) return;
+        this._cfPushTimer = setInterval(() => {
+            try {
+                const io = require('../websocket/SocketManager').getIo();
+                if (!io) return;
+                const crypto = this.getCryptoPrices();
+                const forex  = this.getForexPrices();
+                if (crypto.length > 0) io.emit('market_data_update', { type: 'crypto', data: crypto });
+                if (forex.length > 0)  io.emit('market_data_update', { type: 'forex',  data: forex  });
+            } catch (_) {}
+        }, 5000);
     }
 
     stopCryptoForex() {
         allTicksService.stop();
-        const fastforexService = require('./fastforex.service');
-        fastforexService.stop();
         console.log('🛑 Stopped Forex + Crypto feeds');
     }
 

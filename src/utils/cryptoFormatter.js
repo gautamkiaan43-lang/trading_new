@@ -7,8 +7,11 @@ const formatCryptoData = (instrument, data) => {
     // Ensure instrument is in format like "BTC/USD"
     let formattedInstrument = instrument;
     if (instrument && !instrument.includes('/')) {
-        // BTCUSD -> BTC/USD
-        if (instrument.endsWith('USD')) {
+        // BTCUSDT -> BTC/USD  (AllTick uses USDT suffix, DB stores BTC/USD)
+        if (instrument.endsWith('USDT')) {
+            const base = instrument.replace(/USDT$/, '');
+            formattedInstrument = `${base}/USD`;
+        } else if (instrument.endsWith('USD')) {
             const base = instrument.replace(/USD$/, '');
             formattedInstrument = `${base}/USD`;
         }

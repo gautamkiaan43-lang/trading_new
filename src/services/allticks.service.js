@@ -1,12 +1,15 @@
 /**
  * AllTick Integration Service
  * ───────────────────────────
- * Provides realtime Forex & Crypto market data via AllTick API.
+ * Realtime Forex & Crypto quotes via AllTick API.
  *
  * Primary:  WebSocket  wss://quote.alltick.co/quote-b-ws-api?token=TOKEN
- * Fallback: HTTP Poll  https://quote.alltick.co/quote-b-api/batch-kline?token=TOKEN
+ * Fallback: HTTP Poll  https://quote.alltick.co/quote-b-api/trade-tick?token=TOKEN&query=...
  *
- * Only starts when ALLTICKS_API_KEY is present in env.
+ * API Protocol (confirmed from AllTick docs):
+ *   Subscribe   → cmd_id 22004, symbol field: "code"
+ *   Push ticks  ← cmd_id 22998, identifier field: "code", price field: "price"
+ *   Heartbeat   → cmd_id 22000 | Pong ← cmd_id 22001
  */
 
 const WebSocket = require('ws');
@@ -14,34 +17,34 @@ const axios = require('axios');
 const { formatForexData } = require('../utils/forexFormatter');
 const { formatCryptoData } = require('../utils/cryptoFormatter');
 
-const WS_URL  = 'wss://quote.alltick.co/quote-b-ws-api';
-const HTTP_URL = 'https://quote.alltick.co/quote-b-api/batch-kline';
+const WS_URL         = 'wss://quote.alltick.co/quote-b-ws-api';
+const HTTP_TICK_URL  = 'https://quote.alltick.co/quote-b-api/trade-tick';
 
 class AllTickService {
     constructor() {
-        this.ws               = null;
-        this.pollingInterval  = null;
-        this.heartbeatInterval = null;
-        this.isRunning        = false;
-        this.isWsConnected    = false;
-        this.reconnectAttempts = 0;
+        this.ws                   = null;
+        this.pollingInterval      = null;
+        this.heartbeatInterval    = null;
+        this.isRunning            = false;
+        this.isWsConnected        = false;
+        this.wsDisabled           = false; // set true on 401 — stop retrying WS
+        this.reconnectAttempts    = 0;
         this.maxReconnectAttempts = 10;
 
-        this.token = null; // read fresh on start()
+        this.token = null;
 
-        // ── Symbol Lists ──────────────────────────────────────
         this.forexSymbols = [
             'AUDCAD', 'EURINR', 'EURUSD', 'GBPINR', 'GBPUSD',
             'USDCHF', 'USDINR', 'USDJPY', 'XAGUSD', 'XAUUSD'
         ];
+        // AllTick crypto symbols use USDT suffix (not USD)
         this.cryptoSymbols = [
-            'ADAUSD', 'AVAXUSD', 'BNBUSD', 'BTCUSD', 'DOGEUSD',
-            'DOTUSD', 'ETHUSD', 'MATICUSD', 'SOLUSD', 'XRPUSD'
+            'ADAUSDT', 'AVAXUSDT', 'BNBUSDT', 'BTCUSDT', 'DOGEUSDT',
+            'DOTUSDT', 'ETHUSDT', 'MATICUSDT', 'SOLUSDT', 'XRPUSDT'
         ];
 
-        // ── In-Memory Cache ───────────────────────────────────
-        this.cache         = {}; // symbol -> last formatted data (keeps data alive on reconnect)
-        this.prevCloseCache = {}; // symbol -> previousClose for change % calculation
+        this.cache         = {};
+        this.prevCloseCache = {};
     }
 
     // ─────────────────────────────────────────────────────────
@@ -51,17 +54,21 @@ class AllTickService {
     start() {
         this.token = process.env.ALLTICKS_API_KEY;
         if (!this.token) {
-            console.log('ℹ️  ALLTICKS_API_KEY not set — AllTick service idle.');
+            console.log('[ALLTICKS] ALLTICKS_API_KEY not set — service idle.');
             return;
         }
-        if (this.isRunning) return; // singleton guard
+        if (this.isRunning) return;
         this.isRunning = true;
-        console.log('🚀 Starting AllTick Integration Service (Forex + Crypto)...');
+        console.log('[ALLTICKS] Starting AllTick Integration Service (Forex + Crypto)...');
+        // Always run HTTP polling (5s) as primary source.
+        // WS is attempted in parallel — if it delivers ticks they override HTTP data.
+        // This handles plans where WS connects but sends no ticks.
+        this._startPolling();
         this._connectWs();
     }
 
     stop() {
-        console.log('🛑 Stopping AllTick Integration Service...');
+        console.log('[ALLTICKS] Stopping AllTick Integration Service...');
         this.isRunning = false;
         this._closeWs();
         this._stopPolling();
@@ -72,17 +79,34 @@ class AllTickService {
     // ─────────────────────────────────────────────────────────
 
     _connectWs() {
-        if (!this.isRunning) return;
+        if (!this.isRunning || this.wsDisabled) {
+            if (this.wsDisabled) this._startPolling();
+            return;
+        }
+
         const url = `${WS_URL}?token=${this.token}`;
 
         try {
             this.ws = new WebSocket(url);
 
+            // Handle non-101 upgrade responses (e.g. 401)
+            this.ws.on('unexpected-response', (req, res) => {
+                const code = res.statusCode;
+                if (code === 401) {
+                    console.error('[ALLTICKS] WebSocket 401 Unauthorized — token invalid or plan does not include WS. Falling back to HTTP polling permanently.');
+                    this.wsDisabled = true;
+                } else {
+                    console.error(`[ALLTICKS] WebSocket upgrade failed with HTTP ${code}. Falling back to HTTP polling.`);
+                }
+                this._closeWs();
+                this._startPolling();
+            });
+
             this.ws.on('open', () => {
-                console.log('⚡ AllTick WebSocket Connected');
+                console.log('[ALLTICKS] WebSocket Connected');
                 this.isWsConnected    = true;
                 this.reconnectAttempts = 0;
-                this._stopPolling();   // cancel HTTP fallback if it was running
+                // Keep HTTP polling running — WS may connect but not deliver ticks on limited plans
                 this._subscribe();
                 this._startHeartbeat();
             });
@@ -91,39 +115,46 @@ class AllTickService {
                 try {
                     const msg = JSON.parse(raw.toString());
                     this._handleWsMessage(msg);
-                } catch (_) { /* ignore malformed frames */ }
+                } catch (_) {}
             });
 
             this.ws.on('error', (err) => {
-                console.error('❌ AllTick WS Error:', err.message);
-                this.isWsConnected = false;
-                this._startPolling(); // fallback immediately
+                // 401 is caught by unexpected-response; this handles other errors
+                if (!this.wsDisabled) {
+                    console.error('[ALLTICKS] WS Error:', err.message);
+                    this.isWsConnected = false;
+                    this._startPolling();
+                }
             });
 
             this.ws.on('close', () => {
                 if (this.isWsConnected) {
-                    console.log('🔌 AllTick WebSocket Closed');
+                    console.log('[ALLTICKS] WebSocket Closed');
                 }
                 this.isWsConnected = false;
                 this._stopHeartbeat();
-                if (this.isRunning) {
+                if (this.isRunning && !this.wsDisabled) {
                     this._retryConnection();
                 }
             });
         } catch (err) {
-            console.error('❌ AllTick WS Connection Exception:', err.message);
+            console.error('[ALLTICKS] WS Connection Exception:', err.message);
             this._startPolling();
         }
     }
 
     _retryConnection() {
+        if (this.wsDisabled) {
+            this._startPolling();
+            return;
+        }
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
             const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-            console.log(`🔄 AllTick reconnect in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+            console.log(`[ALLTICKS] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
             setTimeout(() => this._connectWs(), delay);
         } else {
-            console.warn('⚠️  AllTick WS max reconnects reached — staying on HTTP polling.');
+            console.warn('[ALLTICKS] Max WS reconnects reached — switching to HTTP polling permanently.');
             this._startPolling();
         }
     }
@@ -138,7 +169,7 @@ class AllTickService {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  Heartbeat
+    //  Heartbeat  (request: 22000 | pong from server: 22001)
     // ─────────────────────────────────────────────────────────
 
     _startHeartbeat() {
@@ -148,7 +179,8 @@ class AllTickService {
                 this.ws.send(JSON.stringify({
                     cmd_id: 22000,
                     seq_id: Date.now(),
-                    trace: 'heartbeat'
+                    trace:  'hb-' + Date.now(),
+                    data:   {}
                 }));
             }
         }, 10000);
@@ -162,77 +194,75 @@ class AllTickService {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  Subscription
+    //  Subscription  (cmd_id: 22004, field: "code")
     // ─────────────────────────────────────────────────────────
 
     _subscribe() {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         const symbolList = [...this.forexSymbols, ...this.cryptoSymbols]
-            .map(sym => ({ symbol: sym }));
+            .map(sym => ({ code: sym })); // AllTick uses "code", not "symbol"
 
         const subMsg = {
-            cmd_id: 22002,
+            cmd_id: 22004,           // correct subscribe cmd_id per AllTick docs
             seq_id: Date.now(),
-            trace: 'sub_quotes',
-            data: { symbol_list: symbolList }
+            trace:  'sub-' + Date.now(),
+            data:   { symbol_list: symbolList }
         };
 
         this.ws.send(JSON.stringify(subMsg));
-        console.log(`📡 AllTick subscribed to ${symbolList.length} symbols`);
+        console.log(`[ALLTICKS] Subscribed to ${symbolList.length} symbols via WS`);
     }
 
     // ─────────────────────────────────────────────────────────
     //  Message Handling
+    //  Server push ticks use cmd_id 22998 (not 22004)
     // ─────────────────────────────────────────────────────────
 
     _handleWsMessage(msg) {
-        // AllTick tick push: cmd_id 22004, data contains tick(s)
-        if (!msg || !msg.data) return;
+        if (!msg) return;
 
-        if (msg.cmd_id === 22004) {
-            const data = msg.data;
-            if (Array.isArray(data)) {
-                data.forEach(tick => this._processTick(tick));
-            } else if (data && data.symbol) {
-                this._processTick(data);
+        if (msg.cmd_id === 22998) {
+            // Server tick push — data is a single tick object
+            if (msg.data) {
+                this._processTick(msg.data);
             }
-        } else if (msg.cmd_id === 22000) {
-            // Heartbeat pong — ignore silently
         }
+        // cmd_id 22001 = heartbeat pong — ignore silently
+        // cmd_id 22005 = subscription ack — ignore silently
     }
 
-    _processTick(tick) {
-        if (!tick || !tick.symbol) return;
+    // ─────────────────────────────────────────────────────────
+    //  Tick Processing
+    //  AllTick tick fields: code, price, volume, turnover, tick_time
+    // ─────────────────────────────────────────────────────────
 
-        const symbol   = tick.symbol;
+    _processTick(tick) {
+        if (!tick || !tick.code) return;
+
+        const symbol  = tick.code; // AllTick uses "code" not "symbol"
         const isForex  = this.forexSymbols.includes(symbol);
         const isCrypto = this.cryptoSymbols.includes(symbol);
         if (!isForex && !isCrypto) return;
 
-        // AllTick field names: bid, ask, last (or close_price), chg, vol
-        const bid = parseFloat(tick.bid  || tick.open  || tick.last || tick.close_price || 0);
-        const ask = parseFloat(tick.ask  || tick.open  || tick.last || tick.close_price || 0);
-        const ltp = parseFloat(tick.last || tick.close_price || ((bid + ask) / 2) || 0);
+        // AllTick trade-tick only provides "price" (last transaction price)
+        // bid = ask = price since no order book in trade-tick
+        const price = parseFloat(tick.price || 0);
+        if (!price || isNaN(price)) return;
 
-        if (!ltp || isNaN(ltp)) return; // Skip invalid/zero ticks
-
-        // Seed previousClose on first tick (used for % change)
         if (!this.prevCloseCache[symbol]) {
-            this.prevCloseCache[symbol] = ltp;
+            this.prevCloseCache[symbol] = price;
         }
 
         const dataToFormat = {
-            bid,
-            ask,
-            ltp,
+            bid:           price,
+            ask:           price,
+            ltp:           price,
             previousClose: this.prevCloseCache[symbol],
-            volume: tick.vol || tick.volume || '-',
-            change: tick.chg || tick.change || 0
+            volume:        tick.volume || tick.vol || '-',
+            change:        0
         };
 
-        // Update prevClose slowly — use current ltp so next tick shows real delta
-        // (prevClose is only updated when we get a genuine previous-close field)
         if (tick.pre_close_price && parseFloat(tick.pre_close_price) > 0) {
             this.prevCloseCache[symbol] = parseFloat(tick.pre_close_price);
         }
@@ -249,7 +279,7 @@ class AllTickService {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  Broadcast to MarketDataService (price store)
+    //  Broadcast to MarketDataService
     // ─────────────────────────────────────────────────────────
 
     _broadcast(item) {
@@ -257,50 +287,46 @@ class AllTickService {
             const mds = require('./MarketDataService');
             if (!mds || !mds.prices) return;
 
-            const prefix              = item.type; // 'FOREX' | 'CRYPTO'
-            const instrument          = item.instrument; // 'EUR/USD'
+            const prefix              = item.type;
+            const instrument          = item.instrument;
             const slashedSymbol       = `${prefix}:${instrument}`;
             const unslashedInstrument = instrument.replace('/', '');
             const unslashedSymbol     = `${prefix}:${unslashedInstrument}`;
 
-            const base = {
-                ...item,
-                category: prefix.toLowerCase()
-            };
+            const base = { ...item, category: prefix.toLowerCase() };
 
-            // Store under slashed key (e.g. FOREX:EUR/USD)
             mds.prices[slashedSymbol] = {
                 ...mds.prices[slashedSymbol],
                 ...base,
                 symbol: slashedSymbol,
-                name: instrument
+                name:   instrument
             };
             mds.dirtySymbols.add(slashedSymbol);
 
-            // Store under unslashed key (e.g. FOREX:EURUSD) for backward compat
             mds.prices[unslashedSymbol] = {
                 ...mds.prices[unslashedSymbol],
                 ...base,
                 instrument: unslashedInstrument,
-                symbol: unslashedSymbol,
-                name: unslashedInstrument
+                symbol:     unslashedSymbol,
+                name:       unslashedInstrument
             };
             mds.dirtySymbols.add(unslashedSymbol);
         } catch (err) {
-            // Never crash the feed due to broadcast error
-            console.error('⚠️  AllTick broadcast error:', err.message);
+            console.error('[ALLTICKS] Broadcast error:', err.message);
         }
     }
 
     // ─────────────────────────────────────────────────────────
     //  HTTP Polling Fallback
+    //  Uses trade-tick endpoint: GET /quote-b-api/trade-tick
+    //  query param = URL-encoded JSON
     // ─────────────────────────────────────────────────────────
 
     _startPolling() {
-        if (this.pollingInterval || this.isWsConnected) return;
-        console.log('🔄 AllTick falling back to HTTP polling (1s interval)...');
-        this._poll(); // immediate first call
-        this.pollingInterval = setInterval(() => this._poll(), 1000);
+        if (this.pollingInterval) return;
+        console.log('[ALLTICKS] Starting HTTP polling (trade-tick, 5s interval)...');
+        this._poll();
+        this.pollingInterval = setInterval(() => this._poll(), 5000);
     }
 
     _stopPolling() {
@@ -311,67 +337,37 @@ class AllTickService {
     }
 
     async _poll() {
-        if (!this.token || !this.isRunning || this.isWsConnected) return;
+        if (!this.token || !this.isRunning) return;
+
+        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
+        const query = JSON.stringify({
+            trace: 'poll-' + Date.now(),
+            data:  { symbol_list: allSymbols.map(sym => ({ code: sym })) }
+        });
 
         try {
-            // AllTick batch-kline endpoint — POST with JSON body
-            // symbol_list: array of { symbol, kline_type, kline_timestamp_end, query_kline_num }
-            // For latest tick (not kline), we use query_kline_num=1 with kline_type=1 (1-min)
-            const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
-            const symbolList = allSymbols.map(sym => ({
-                symbol: sym,
-                kline_type: 1,          // 1-minute kline
-                kline_timestamp_end: 0, // 0 = latest
-                query_kline_num: 1      // only need the latest candle
-            }));
-
-            const response = await axios.post(
-                `${HTTP_URL}?token=${this.token}`,
-                { symbol_list: symbolList },
-                {
-                    timeout: 5000,
-                    headers: { 'Content-Type': 'application/json' }
-                }
-            );
+            const response = await axios.get(HTTP_TICK_URL, {
+                params:  { token: this.token, query },
+                timeout: 5000
+            });
 
             const respData = response.data;
-            if (!respData) return;
-
-            // AllTick HTTP response: { code, msg, data: { kline_list: [...] } }
-            // OR: { code, data: [ { symbol, kline_list: [...] } ] }
-            const dataBlock = respData.data;
-            if (!dataBlock) return;
-
-            if (Array.isArray(dataBlock)) {
-                // Format: [ { symbol, kline_list: [{open,high,low,close,vol,...}] } ]
-                dataBlock.forEach(entry => {
-                    if (!entry.symbol || !Array.isArray(entry.kline_list) || !entry.kline_list.length) return;
-                    const kline = entry.kline_list[entry.kline_list.length - 1]; // most recent candle
-                    this._processTick({
-                        symbol: entry.symbol,
-                        last: kline.close,
-                        bid:  kline.close,
-                        ask:  kline.close,
-                        vol:  kline.vol || kline.volume || '-',
-                        pre_close_price: kline.open // use open as prevClose proxy
-                    });
-                });
-            } else if (dataBlock.kline_list && Array.isArray(dataBlock.kline_list)) {
-                // Alternative format with a flat kline_list
-                dataBlock.kline_list.forEach(entry => {
-                    if (!entry.symbol) return;
-                    this._processTick({
-                        symbol: entry.symbol,
-                        last: entry.close,
-                        bid:  entry.close,
-                        ask:  entry.close,
-                        vol:  entry.vol || '-'
-                    });
-                });
+            if (!respData || respData.ret !== 200) {
+                if (respData?.ret === 401) {
+                    console.error('[ALLTICKS] HTTP 401 — token invalid. Stopping polling.');
+                    this._stopPolling();
+                }
+                return;
             }
+
+            const tickList = respData.data?.tick_list;
+            if (!Array.isArray(tickList)) return;
+
+            tickList.forEach(tick => this._processTick(tick));
+
         } catch (err) {
             if (err.code !== 'ECONNABORTED') {
-                console.error('⚠️  AllTick HTTP Poll Error:', err.message);
+                console.error('[ALLTICKS] HTTP Poll Error:', err.message);
             }
         }
     }

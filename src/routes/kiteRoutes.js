@@ -707,6 +707,56 @@ function bustWatchlistCache() {
     console.log('🔄 Watchlist cache busted (contract selection changed)');
 }
 
+// ── One-time CE/PE 2nd expiry auto-exclusion ──────────────────────────────
+// Runs on first watchlist build. Adds 2nd+ expiry MCX/NFO option contracts
+// to excluded list so live quotes shows only nearest 1 expiry by default.
+// Skips if excluded list already has CE/PE entries (previous session done,
+// admin changes preserved across restarts).
+let _cepeExclInitialized = false;
+const _EXCLUDED_FILE_PATH = path.join(__dirname, '../data/excluded_contracts.json');
+
+function _initCepeExclOnce(pc, today) {
+    if (_cepeExclInitialized) return;
+    _cepeExclInitialized = true;
+
+    const excl = (global.EXCLUDED_CONTRACTS || []).slice();
+
+    // If excluded list already has CE/PE option entries → previous session
+    // already initialized, admin's enabled choices preserved — skip.
+    const alreadyDone = excl.some(s =>
+        (s.startsWith('MCX:') || s.startsWith('NFO:')) &&
+        (s.slice(-2) === 'CE' || s.slice(-2) === 'PE')
+    );
+    if (alreadyDone) return;
+
+    let changed = false;
+    for (const [exchange, optIndex] of [['MCX', pc.mcxOptIndex], ['NFO', pc.nfoOptIndex]]) {
+        for (const optList of Object.values(optIndex)) {
+            const expiries = [...new Set(
+                optList.filter(i => new Date(i.expiry || 0) >= today).map(i => i.expiry)
+            )].sort((a, b) => new Date(a) - new Date(b));
+
+            expiries.forEach((expiry, idx) => {
+                if (idx < 1) return; // keep nearest 1 expiry enabled
+                for (const inst of optList) {
+                    if (inst.expiry !== expiry) continue;
+                    const fullKey = `${exchange}:${inst.tradingsymbol}`;
+                    if (!excl.includes(fullKey)) {
+                        excl.push(fullKey);
+                        changed = true;
+                    }
+                }
+            });
+        }
+    }
+
+    if (changed) {
+        global.EXCLUDED_CONTRACTS = excl;
+        try { fs.writeFileSync(_EXCLUDED_FILE_PATH, JSON.stringify(excl, null, 2)); } catch (_) {}
+        console.log(`✅ CE/PE 2nd expiry auto-excluded: ${excl.length} total excluded`);
+    }
+}
+
 // Auto-refresh loop: keeps cache warm every 2s after first request
 let watchlistAutoRefreshStarted = false;
 function startWatchlistAutoRefresh() {
@@ -872,12 +922,12 @@ function _getPrecomputed(instruments, query) {
             }
         }
     }
-    // Sort each base ascending by expiry, keep at most 3 (previous + current + next)
+    // Sort ascending by expiry, keep up to 6 in pool (Contract Management controls which are active)
     for (const base of mcxFutBases) {
         if (mcxFutByBase[base]) {
             mcxFutByBase[base] = mcxFutByBase[base]
                 .sort((a, b) => new Date(a.expiry) - new Date(b.expiry))
-                .slice(0, 3);
+                .slice(0, 6);
         }
     }
 
@@ -898,25 +948,25 @@ function _getPrecomputed(instruments, query) {
         for (const f of contracts) ltpKeys.push(f.fullKey);
     }
 
-    // ── NFO stock futures: nearest 1 expiry per stock across NIFTY50+BANKNIFTY+FINNIFTY+MIDCAP ──
+    // ── NFO stock futures: build pool (up to 3 expiries per base, sorted asc).
+    // Excluded filter is applied in _buildWatchlistData (same pattern as MCX mcxFutByBase).
     const nfoFutIdx = indexedInstruments['NFO']?.FUT || [];
-    const nfoFutByName = {};
+    const nfoFutByBase = {}; // UPPERCASE name → [{tradingsymbol, expiry, fullKey}]
     for (const inst of nfoFutIdx) {
         const name = String(inst.name || '').toUpperCase();
         const exp = new Date(inst.expiry || 0);
         if (exp < today) continue;
-        if (!nfoFutByName[name] || exp < new Date(nfoFutByName[name].expiry)) nfoFutByName[name] = inst;
+        if (!nfoFutByBase[name]) nfoFutByBase[name] = [];
+        nfoFutByBase[name].push({ tradingsymbol: inst.tradingsymbol, expiry: inst.expiry, fullKey: `NFO:${inst.tradingsymbol}` });
     }
+    for (const name of Object.keys(nfoFutByBase)) {
+        nfoFutByBase[name] = nfoFutByBase[name]
+            .sort((a, b) => new Date(a.expiry) - new Date(b.expiry))
+            .slice(0, 3);
+    }
+    // nfoFutKeys for STOCKS is intentionally left empty here — _buildWatchlistData populates it
+    // after applying the excluded filter from Contract Management.
     const nfoStockUniverse = ALL_NSE_STOCKS.length > 0 ? ALL_NSE_STOCKS : NIFTY50;
-    for (const stockSym of nfoStockUniverse) {
-        const inst = nfoFutByName[stockSym.toUpperCase()];
-        if (!inst) continue;
-        const fullKey = `NFO:${inst.tradingsymbol}`;
-        if (!nfoFutKeys.includes(fullKey)) {
-            nfoFutKeys.push(fullKey);
-            nfoFutMeta[fullKey] = { expiry: toYmd(inst.expiry) };
-        }
-    }
 
     // Build NFO/MCX option instrument index ONCE (avoid scanning 100K per underlying)
     const nfoOptIndex = {}; // underlying → [{ inst, strike, type, expiry }]
@@ -935,7 +985,7 @@ function _getPrecomputed(instruments, query) {
         }
     }
 
-    _precomputed = { nseKeys, nfoConfig, nfoFutKeys, nfoFutMeta, mcxFutBases, mcxFutByBase, mcxOptRequested, mcxOptRange, ltpKeys, nfoOptIndex, mcxOptIndex, indexSymbolMap };
+    _precomputed = { nseKeys, nfoConfig, nfoFutKeys, nfoFutMeta, nfoFutByBase, nfoStockUniverse, mcxFutBases, mcxFutByBase, mcxOptRequested, mcxOptRange, ltpKeys, nfoOptIndex, mcxOptIndex, indexSymbolMap };
     _precomputedInstrTime = instrumentsCacheTime;
     _precomputedQuerySig = querySig;
     console.log(`⚡ Precomputed: NSE=${nseKeys.length} | NFO underlyings=${nfoConfig.length} | MCX bases=${mcxFutBases.length} | LTP keys=${ltpKeys.length}`);
@@ -971,6 +1021,12 @@ async function _buildWatchlistData(query, userId) {
         try { ltpQuotes = await kiteService.getQuote(pc.ltpKeys); } catch (_) { }
     }
 
+    // One-time: auto-exclude 2nd expiry CE/PE options so default count stays at 1 expiry
+    _initCepeExclOnce(pc, today);
+
+    // Excluded contracts — used by options (step 2), MCX FUT (step 3), NFO stock FUT (step 3b), MCX OPT (step 4)
+    const _excl = global.EXCLUDED_CONTRACTS || [];
+
     // ── Step 2: NFO index options ──
     const nfoIndexOptRange = parseInt(query.nfoIndexOptRange, 10);
     const nfoOptRangePts = Number.isFinite(nfoIndexOptRange) && nfoIndexOptRange > 0 ? nfoIndexOptRange : 5000;
@@ -982,35 +1038,63 @@ async function _buildWatchlistData(query, userId) {
         if (!step) continue;
         const ltp = resolveNfoIndexSpotLtp(ltpQuotes, cfg);
         if (!ltp) continue;
-        const expiryYmd = cfg.expiry;
-        if (!expiryYmd) continue;
-        const requestedExpiry = new Date(expiryYmd).toDateString();
+        const optList = pc.nfoOptIndex[cfg.underlying] || [];
+        // Nearest 2 non-expired option expiries — matches Contract Management display
+        const nfoOptExpiries = [...new Set(
+            optList.filter(i => new Date(i.expiry || 0) >= today).map(i => i.expiry)
+        )].sort((a, b) => new Date(a) - new Date(b)).slice(0, 2);
+        if (nfoOptExpiries.length === 0) continue;
         const lowerBound = Math.floor((ltp - nfoOptRangePts) / step) * step;
         const upperBound = Math.ceil((ltp + nfoOptRangePts) / step) * step;
         const strikeSet = new Set();
         for (let s = lowerBound; s <= upperBound; s += step) strikeSet.add(s);
-        const optList = pc.nfoOptIndex[cfg.underlying] || [];
-        for (const inst of optList) {
-            if (new Date(inst.expiry || 0).toDateString() !== requestedExpiry) continue;
-            const strike = Number(inst.strike);
-            if (!strikeSet.has(strike)) continue;
-            const fullKey = `NFO:${inst.tradingsymbol}`;
-            const it = String(inst.instrument_type || '').toUpperCase();
-            nfoOptKeys.push(fullKey);
-            nfoOptMeta[fullKey] = { strike, optionType: it, expiry: expiryYmd };
+        for (const expiry of nfoOptExpiries) {
+            const expiryYmd = toYmd(expiry);
+            const requestedExpiry = new Date(expiry).toDateString();
+            for (const inst of optList) {
+                if (new Date(inst.expiry || 0).toDateString() !== requestedExpiry) continue;
+                const strike = Number(inst.strike);
+                if (!strikeSet.has(strike)) continue;
+                const fullKey = `NFO:${inst.tradingsymbol}`;
+                if (_excl.includes(fullKey)) continue;
+                const it = String(inst.instrument_type || '').toUpperCase();
+                nfoOptKeys.push(fullKey);
+                nfoOptMeta[fullKey] = { strike, optionType: it, expiry: expiryYmd };
+            }
         }
     }
 
-    // ── Step 3: MCX Futures keys (up to 3 expiries: previous + current + next) ──
+    // ── Step 3: MCX Futures — skip excluded contracts (Contract Management controls visibility) ──
     const mcxFutKeys = [];
     const mcxFutMeta = {};
     for (const base of pc.mcxFutBases) {
         const contracts = pc.mcxFutByBase[base] || [];
         for (const f of contracts) {
+            if (_excl.includes(f.fullKey)) continue;
             mcxFutKeys.push(f.fullKey);
             mcxFutMeta[f.fullKey] = { expiry: toYmd(f.expiry) };
         }
     }
+
+    // ── Step 3b: NFO Stock Futures — same excluded-filter pattern as MCX ──
+    // pc.nfoFutKeys has only INDEX futures (NIFTY/BANKNIFTY/etc.) from precompute.
+    // Stock futures are built here from the pool so Contract Management enable/disable works.
+    const nfoStockFutKeys = [];
+    const nfoStockFutMeta = {};
+    for (const stockSym of (pc.nfoStockUniverse || [])) {
+        const pool = pc.nfoFutByBase[stockSym.toUpperCase()] || [];
+        for (const f of pool) {
+            if (_excl.includes(f.fullKey)) continue;
+            if (!nfoStockFutKeys.includes(f.fullKey)) {
+                nfoStockFutKeys.push(f.fullKey);
+                nfoStockFutMeta[f.fullKey] = { expiry: toYmd(f.expiry) };
+            }
+        }
+    }
+    // Index futures from precompute also respect excluded
+    const activeIndexFutKeys = pc.nfoFutKeys.filter(k => !_excl.includes(k));
+    // Combined NFO FUT keys used in steps 5 and 6
+    const allNfoFutKeys = [...activeIndexFutKeys, ...nfoStockFutKeys];
 
     // ── Step 4: MCX Options (ATM ±range filter, same as NFO options) ──
     const mcxOptRangePts = pc.mcxOptRange || 5000;
@@ -1040,42 +1124,64 @@ async function _buildWatchlistData(query, userId) {
                     NATURALGAS: 200,
                     NATURALGASMINI: 200,
                     MNATURALGAS: 200,
-                    GOLD: 72000,
-                    GOLDM: 72000,
-                    MGOLD: 72000,
-                    SILVER: 85000,
-                    SILVERM: 85000,
-                    MSILVER: 85000
+                    GOLD: 93000,
+                    GOLDM: 93000,
+                    MGOLD: 93000,
+                    SILVER: 95000,
+                    SILVERM: 95000,
+                    MSILVER: 95000
                 };
                 ltp = mcxDefaults[base] || 1000;
             }
         }
-        const nearestOpt = pickNearestExpiry(instruments, { exchange: 'MCX', name: base, instrumentTypes: ['CE', 'PE'] });
-        if (!nearestOpt) continue;
-        const expiryYmd = toYmd(nearestOpt.expiry);
-        if (!expiryYmd) continue;
-        const requestedExpiry = new Date(expiryYmd).toDateString();
+        const optList = pc.mcxOptIndex[base] || [];
+        // Nearest 2 non-expired option expiries — matches Contract Management display
+        const mcxOptExpiries = [...new Set(
+            optList.filter(i => new Date(i.expiry || 0) >= today).map(i => i.expiry)
+        )].sort((a, b) => new Date(a) - new Date(b)).slice(0, 2);
+        if (mcxOptExpiries.length === 0) continue;
 
-        // Build ATM strike range
+        // Build ATM strike range (same for all expiries of this base)
         const lowerBound = Math.floor((ltp - mcxOptRangePts) / step) * step;
         const upperBound = Math.ceil((ltp + mcxOptRangePts) / step) * step;
         const strikeSet = new Set();
         for (let s = lowerBound; s <= upperBound; s += step) strikeSet.add(s);
 
-        const optList = pc.mcxOptIndex[base] || [];
-        for (const inst of optList) {
-            if (new Date(inst.expiry || 0).toDateString() !== requestedExpiry) continue;
-            const strike = Number(inst.strike);
-            if (!strikeSet.has(strike)) continue; // outside ATM ±range
-            const fullKey = `MCX:${inst.tradingsymbol}`;
-            const it = String(inst.instrument_type || '').toUpperCase();
-            mcxOptKeys.push(fullKey);
-            mcxOptMeta[fullKey] = { strike, optionType: it, expiry: expiryYmd, base };
+        for (const expiry of mcxOptExpiries) {
+            const expiryYmd = toYmd(expiry);
+            const requestedExpiry = new Date(expiry).toDateString();
+            for (const inst of optList) {
+                if (new Date(inst.expiry || 0).toDateString() !== requestedExpiry) continue;
+                const strike = Number(inst.strike);
+                if (!strikeSet.has(strike)) continue; // outside ATM ±range
+                const fullKey = `MCX:${inst.tradingsymbol}`;
+                if (_excl.includes(fullKey)) continue;
+                const it = String(inst.instrument_type || '').toUpperCase();
+                mcxOptKeys.push(fullKey);
+                mcxOptMeta[fullKey] = { strike, optionType: it, expiry: expiryYmd, base };
+            }
         }
     }
 
+    // Sort MCX options sequentially: base -> expiry -> strike -> type
+    mcxOptKeys.sort((a, b) => {
+        const mA = mcxOptMeta[a];
+        const mB = mcxOptMeta[b];
+        if (!mA || !mB) return 0;
+
+        const baseOrder = { GOLD: 0, GOLDM: 0, SILVER: 1, SILVERM: 1, CRUDEOIL: 2, CRUDEOILM: 2, NATURALGAS: 3, NATURALGASMINI: 3 };
+        const baseA = baseOrder[mA.base] !== undefined ? baseOrder[mA.base] : 999;
+        const baseB = baseOrder[mB.base] !== undefined ? baseOrder[mB.base] : 999;
+
+        if (baseA !== baseB) return baseA - baseB;
+        if (mA.expiry !== mB.expiry) return mA.expiry.localeCompare(mB.expiry);
+        if (mA.strike !== mB.strike) return mA.strike - mB.strike;
+        if (mA.optionType !== mB.optionType) return mA.optionType.localeCompare(mB.optionType);
+        return 0;
+    });
+
     // ── Step 5: ONE batch quote fetch for ALL symbols ──
-    const allKeys = [...pc.nseKeys, ...pc.nfoFutKeys, ...nfoOptKeys, ...mcxFutKeys, ...mcxOptKeys];
+    const allKeys = [...pc.nseKeys, ...allNfoFutKeys, ...nfoOptKeys, ...mcxFutKeys, ...mcxOptKeys];
     const uniqueKeys = Array.from(new Set(allKeys));
     const rawQuotes = {};
     const chunks = [];
@@ -1100,8 +1206,8 @@ async function _buildWatchlistData(query, userId) {
     // ── Step 6: Build all rows ──
     let rows = [];
     for (const key of pc.nseKeys) rows.push(buildUnifiedRow({ type: 'NSE', symbol: key, quote: rawQuotes[key], lotSize: getLotSize(key) }));
-    for (const key of pc.nfoFutKeys) {
-        const m = pc.nfoFutMeta[key] || {};
+    for (const key of allNfoFutKeys) {
+        const m = pc.nfoFutMeta[key] || nfoStockFutMeta[key] || {};
         rows.push(buildUnifiedRow({ type: 'FUT', symbol: key, expiry: m.expiry, quote: rawQuotes[key], lotSize: getLotSize(key) }));
     }
     for (const key of nfoOptKeys) {
@@ -1126,7 +1232,7 @@ async function _buildWatchlistData(query, userId) {
     const _nfoOptCnt = rows.filter(r => r.type === 'NFO_OPT').length;
     const _mcxFutCnt = rows.filter(r => r.type === 'MCX_FUT').length;
     const _mcxOptCnt = rows.filter(r => r.type === 'MCX_OPT').length;
-    console.log(`🔍 _buildWatchlistData rows: NSE=${_nseCnt} NFO_FUT=${_nfoFutCnt} NFO_OPT=${_nfoOptCnt} MCX_FUT=${_mcxFutCnt} MCX_OPT=${_mcxOptCnt} mcxFutKeys=${mcxFutKeys.length} nfoFutKeys=${pc.nfoFutKeys.length} total=${rows.length}`);
+    console.log(`🔍 _buildWatchlistData rows: NSE=${_nseCnt} NFO_FUT=${_nfoFutCnt} NFO_OPT=${_nfoOptCnt} MCX_FUT=${_mcxFutCnt} MCX_OPT=${_mcxOptCnt} mcxFutKeys=${mcxFutKeys.length} nfoFutKeys=${allNfoFutKeys.length}(idx=${activeIndexFutKeys.length}+stk=${nfoStockFutKeys.length}) total=${rows.length}`);
     if (mcxFutKeys.length === 0) console.log(`🔍 mcxFutByBase keys: ${Object.keys(pc.mcxFutByBase).join(', ')}`);
 
     // ── Step 8: Push via WebSocket ──

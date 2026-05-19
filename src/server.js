@@ -181,7 +181,7 @@ runMigrations()
             console.log('⚠️  Market initialization error. Only real data will be shown:', err.message);
         }
 
-        // Start Crypto + Forex feeds (FastForex) — independent of Kite
+        // Start Crypto + Forex feeds (AllTick) — independent of Kite
         try {
             marketDataService.startCryptoForex();
         } catch (cfErr) {
