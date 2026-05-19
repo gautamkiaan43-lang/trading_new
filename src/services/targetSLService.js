@@ -90,10 +90,10 @@ const monitorTargetSL = async () => {
 const autoCloseTrade = async (trade, exitPrice, reason) => {
     try {
         const remark = reason === 'TARGET_HIT' ? '🎯 Target Reached (Profit)' : '❌ Stop Loss Hit (Loss)';
-        
+
         // Use the centralized TradeService to handle complex P/L and Brokerage logic
-        // requesterId = 0 signifies an automated/system closure
-        await tradeService.closeTrade(trade.id, exitPrice, 0, null, remark);
+        // Pass user_id as requesterId so closed_by shows the client name, not ADMIN
+        await tradeService.closeTrade(trade.id, exitPrice, trade.user_id, null, remark);
         
         console.log(`[TargetSL] ✅ Trade #${trade.id} auto-closed | Exit: ${exitPrice} | Reason: ${reason}`);
     } catch (err) {
