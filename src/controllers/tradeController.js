@@ -1560,9 +1560,14 @@ const getTrades = async (req, res) => {
                 const configMap = {};
                 configRows.forEach(c => { configMap[c.user_id] = JSON.parse(c.config_json || '{}'); });
 
-                // ❌ REMOVED: Don't recalculate margin_used - use the value stored in database
-                // The margin_used is already correctly calculated and stored when trade is placed
-                // Recalculating it here overwrites INTRADAY margin with HOLDING margin calculation
+                // ✅ RECALCULATE: Dynamically calculate holding margin for OPEN trades
+                // This ensures margins reflect the latest configuration (e.g., zero margin settings)
+                const MarginUtils = require('../utils/MarginUtils');
+                rows.forEach(trade => {
+                    const clientConfig = configMap[trade.user_id] || {};
+                    const calc = MarginUtils.calculateTotalRequiredHoldingMargin([trade], clientConfig);
+                    trade.margin_used = calc;
+                });
             }
         }
 
