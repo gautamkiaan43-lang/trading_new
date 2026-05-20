@@ -5,6 +5,26 @@ const { invalidateCache } = require('../utils/cacheManager');
 const kiteService = require('../utils/kiteService');
 const { getLotSize } = require('../utils/symbolHelper');
 
+// ═══════════════════════════════════════════════════════════════════
+// 🔒 LAST VALID BID/ASK CACHE: Store last valid prices when market open
+// ═══════════════════════════════════════════════════════════════════
+const lastValidBidAskCache = {};  // Format: { 'SYMBOL': { bid: X, ask: Y, timestamp: Z } }
+
+const cacheLastValidBidAsk = (symbol, bid, ask) => {
+    if (bid > 0 && ask > 0) {
+        lastValidBidAskCache[symbol] = {
+            bid: parseFloat(bid),
+            ask: parseFloat(ask),
+            timestamp: new Date().toISOString()
+        };
+        console.log(`[Cache] Stored last valid bid/ask for ${symbol}: bid=${bid}, ask=${ask}`);
+    }
+};
+
+const getLastValidBidAsk = (symbol) => {
+    return lastValidBidAskCache[symbol] || null;
+};
+
 const syncPaperPosition = async (userId, symbol, connection = db) => {
     try {
         console.log(`[syncPaperPosition] Syncing paper position (Service) for user ${userId}, symbol ${symbol}`);
@@ -172,17 +192,22 @@ class TradeService {
                         if (quote && quote.last_price > 0) {
                             let bid = quote.depth?.buy?.[0]?.price;
                             let ask = quote.depth?.sell?.[0]?.price;
-                            
+
+                            // If depth data available, cache it for later use
+                            if (bid > 0 && ask > 0) {
+                                cacheLastValidBidAsk(kiteSym, bid, ask);
+                            }
+
                             if (!bid || bid <= 0) bid = quote.last_price;
                             if (!ask || ask <= 0) ask = quote.last_price;
 
                             finalExitPrice = trade.type === 'BUY' ? bid : ask;
-                            
+
                             // If it still evaluates to 0, use last_price
                             if (!finalExitPrice || finalExitPrice <= 0) {
                                 finalExitPrice = quote.last_price;
                             }
-                            
+
                             console.log(`[TradeService] ✅ Real Zerodha Price Received: ${finalExitPrice} (LTP: ${quote.last_price}, Bid: ${bid}, Ask: ${ask})`);
                         }
                     } catch (e) {
@@ -207,12 +232,84 @@ class TradeService {
                     }
                 }
 
-                // 🎯 3. Final Fallback (Entry Price)
+                // 🎯 3. Use Cached Valid Bid/Ask (Market Close Protection)
                 if (!finalExitPrice || finalExitPrice <= 0) {
-                    finalExitPrice = trade.entry_price;
-                    console.warn(`[TradeService] ⚠️ No live price found, using Entry Price: ${finalExitPrice}`);
+                    const cachedBidAsk = getLastValidBidAsk(trade.symbol);
+                    if (cachedBidAsk && cachedBidAsk.bid > 0 && cachedBidAsk.ask > 0) {
+                        const cachedPrice = trade.type === 'BUY' ? cachedBidAsk.bid : cachedBidAsk.ask;
+                        finalExitPrice = cachedPrice;
+                        console.log(`[TradeService] ✅ Using cached bid/ask from ${cachedBidAsk.timestamp}: ${finalExitPrice} (Bid: ${cachedBidAsk.bid}, Ask: ${cachedBidAsk.ask})`);
+                    } else {
+                        // 🎯 4. Final Fallback (Entry Price) - only if no cache available
+                        finalExitPrice = trade.entry_price;
+                        console.warn(`[TradeService] ⚠️ No cached bid/ask and no live price, using Entry Price: ${finalExitPrice}`);
+                    }
                 }
             }
+
+            // ═══════════════════════════════════════════════════════════════════
+            // 🔒 DEPTH DATA CHECK: Use cached bid/ask when Zerodha depth unavailable
+            // ═══════════════════════════════════════════════════════════════════
+
+            // Get market close status
+            const now = new Date();
+            const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+            const currentHour = istTime.getHours();
+            const currentMin = istTime.getMinutes();
+            const isMcxMarketClosed = (mType === 'MCX' && (currentHour >= 23 || (currentHour === 23 && currentMin >= 30)));
+
+            // Check if depth data was available from Zerodha
+            let depthDataWasAvailable = false;
+            let priceSource = 'UNKNOWN';
+
+            // If we got Kite quote and it had depth, mark it as available
+            if (exitPrice === null || exitPrice <= 0) {
+                if (isIndianSegment && kiteService.isAuthenticated()) {
+                    try {
+                        const kiteSym = trade.symbol.includes(':') ? trade.symbol : (mType === 'MCX' ? `MCX:${trade.symbol}` : (mType === 'EQUITY' ? `NSE:${trade.symbol}` : `NFO:${trade.symbol}`));
+                        const quoteRes = await kiteService.getQuote(kiteSym);
+                        const quote = quoteRes[kiteSym] || Object.values(quoteRes)[0];
+
+                        // Check if depth data exists
+                        if (quote && quote.depth?.buy?.[0]?.price && quote.depth?.sell?.[0]?.price) {
+                            depthDataWasAvailable = true;
+                            priceSource = 'KITE_DEPTH';
+                            console.log(`[TradeService] ✅ Depth data available from Kite`);
+                        } else if (quote && quote.last_price > 0) {
+                            depthDataWasAvailable = false;
+                            priceSource = 'KITE_LTP_ONLY';
+                            console.warn(`[TradeService] ⚠️ Depth data NOT available from Kite, only LTP received`);
+                        }
+                    } catch (e) {
+                        depthDataWasAvailable = false;
+                        priceSource = 'FALLBACK';
+                    }
+                }
+            }
+
+            // If market is closed and depth was NOT available, warn about potential stale LTP
+            if (isMcxMarketClosed && !depthDataWasAvailable) {
+                console.warn(`
+🚨 [MARKET CLOSE + NO DEPTH DATA]
+   Time: ${currentHour}:${currentMin} IST (Market Closed)
+   Symbol: ${trade.symbol}
+   Issue: Zerodha depth data not available, using stale/fallback price
+   Exit Price: ₹${finalExitPrice}
+   Source: ${priceSource}
+   ⚠️  Price may be LTP from before market close, not current bid/ask
+                `);
+            }
+
+            console.log(`
+[TradeService] 📊 PRICE SOURCE INFO
+   Trade ID: ${trade.id}
+   Symbol: ${trade.symbol}
+   Entry: ₹${parseFloat(trade.entry_price).toFixed(2)}
+   Exit: ₹${parseFloat(finalExitPrice).toFixed(2)}
+   Source: ${priceSource}
+   Depth Available: ${depthDataWasAvailable ? 'YES' : 'NO'}
+   Market Status: ${isMcxMarketClosed ? 'CLOSED (23:30+)' : 'OPEN'}
+            `);
 
             // Use provided P/L from frontend if available (calculated at the moment of exit)
             // Otherwise calculate it based on exit price and actual_qty (for new trades with units/lots mode)
