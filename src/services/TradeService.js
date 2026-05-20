@@ -176,11 +176,12 @@ class TradeService {
             }
 
             let finalExitPrice = exitPrice;
+            const isIndianSegment = ['MCX', 'NSE', 'NFO', 'EQUITY', 'OPTIONS'].includes(mType);
+
             if (!finalExitPrice || finalExitPrice <= 0) {
                 const { getMcxBaseScrip } = require('../utils/symbolHelper');
                 const base = getMcxBaseScrip(trade.symbol);
                 const marketDataService = require('./MarketDataService');
-                const isIndianSegment = ['MCX', 'NSE', 'NFO', 'EQUITY', 'OPTIONS'].includes(mType);
 
                 // 🎯 1. For Indian Segments, try Kite API (Direct Quote) FIRST for accuracy
                 if (isIndianSegment && kiteService.isAuthenticated()) {
