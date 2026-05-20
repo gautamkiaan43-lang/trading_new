@@ -483,19 +483,29 @@ class TradeService {
             // 5. Update Database
             const balanceChange = pnl - brokerage - swap;
 
-            let closedByRole = 'TRADER';
+            // Determine closed_by: Store username if TRADER, role name if ADMIN/SUPERADMIN
+            let closedByValue = 'TRADER';
             if (requesterId === 0) {
-                closedByRole = 'ADMIN';
+                closedByValue = 'ADMIN';
             } else {
-                const [reqUserRows] = await connection.execute('SELECT role FROM users WHERE id = ?', [requesterId]);
-                if (reqUserRows.length > 0 && reqUserRows[0].role !== 'TRADER') {
-                    closedByRole = 'ADMIN';
+                const [reqUserRows] = await connection.execute(
+                    'SELECT role, username FROM users WHERE id = ?',
+                    [requesterId]
+                );
+                if (reqUserRows.length > 0) {
+                    if (reqUserRows[0].role !== 'TRADER') {
+                        // Admin/SuperAdmin — store role
+                        closedByValue = reqUserRows[0].role;
+                    } else {
+                        // Trader — store actual username for display
+                        closedByValue = reqUserRows[0].username || 'TRADER';
+                    }
                 }
             }
 
             await connection.execute(
                 'UPDATE trades SET status = "CLOSED", exit_price = ?, exit_time = NOW(), pnl = ?, brokerage = ?, swap = ?, closed_by = ?, close_remark = ? WHERE id = ?',
-                [finalExitPrice, pnl, brokerage, swap, closedByRole, remark, tradeId]
+                [finalExitPrice, pnl, brokerage, swap, closedByValue, remark, tradeId]
             );
 
             await connection.execute(
