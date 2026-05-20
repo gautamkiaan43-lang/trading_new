@@ -1325,8 +1325,9 @@ const placeOrder = async (req, res) => {
                 newMarginRequired = parseFloat(marginRequired) || ((executionPrice * qtyInput * lotSizeAtEntry) / 500);
             }
             // Back-calculate leverage for logging
-            leverageUsed = finalTurnover / (newMarginRequired || 1);
-            console.log(`[placeOrder] 🪙 MCX/Other Margin: ${newMarginRequired} (approx leverage: ${leverageUsed.toFixed(1)}x)`);
+            // If margin is 0, leverage is 0 (not infinity or huge number)
+            leverageUsed = newMarginRequired > 0 ? finalTurnover / newMarginRequired : 0;
+            console.log(`[placeOrder] 🪙 MCX/Other Margin: ${newMarginRequired} (approx leverage: ${leverageUsed > 0 ? leverageUsed.toFixed(1) : '0'}x)`);
         }
         // --------------------------------------------------
 
