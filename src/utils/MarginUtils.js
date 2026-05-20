@@ -22,16 +22,19 @@ const MarginUtils = {
 
                 // Priority 1: Scrip-specific Lot-wise HOLDING Margin (Fixed Amount or Exposure)
                 const scripConfig = brokerMargins[upperSym] || brokerMargins[baseScrip];
-                const holdingMarginValue = parseFloat(scripConfig?.HOLDING || scripConfig?.holding_exposure || 0);
+                const holdingMarginValue = parseFloat(scripConfig?.HOLDING || scripConfig?.holding_exposure);
 
-                if (holdingMarginValue > 0) {
+                if (holdingMarginValue !== undefined && holdingMarginValue >= 0) {  // Allow 0!
                     // If it's a fixed amount per lot (usually > 1000) or exposure divisor (usually 100)
                     if (holdingMarginValue > 500) {
                         // Fixed Amount per lot
                         tradeMargin = holdingMarginValue * qtyNum;
-                    } else {
+                    } else if (holdingMarginValue > 0) {
                         // Exposure Divisor
                         tradeMargin = turnover / holdingMarginValue;
+                    } else {
+                        // holdingMarginValue = 0, so margin = 0
+                        tradeMargin = 0;
                     }
                 } else {
                     // Priority 2: Global Exposure-based Calculation (HOLDING)
@@ -50,8 +53,9 @@ const MarginUtils = {
                 tradeMargin = turnover / (holdingExposure || 1);
             }
 
-            // Fallback for any missed segments or 0 results
-            if (tradeMargin <= 0 && turnover > 0) {
+            // Fallback for any missed segments or 0 results (but keep 0 if intentional)
+            // Only fallback if tradeMargin is undefined/NaN, not if it's 0
+            if (!Number.isFinite(tradeMargin) && turnover > 0) {
                 tradeMargin = turnover / 100; // 1% fallback
             }
 
