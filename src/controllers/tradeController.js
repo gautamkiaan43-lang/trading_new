@@ -441,14 +441,26 @@ const placeOrder = async (req, res) => {
                 instrumentLotSize = maxLot; // Fallback to the global MCX maxLot if specific is not set
             }
 
-            // Check total lots currently held for this base symbol (e.g. all GOLD contracts)
-            const [openBaseTrades] = await db.execute(
-                `SELECT type, COALESCE(SUM(qty), 0) as total_qty 
-                 FROM trades 
-                 WHERE user_id = ? AND status = "OPEN" AND market_type = "MCX" AND symbol LIKE ?
-                 GROUP BY type`,
-                [targetUserId, `%${baseSym}%`]
+            // Check total lots currently held for this EXACT base symbol
+            // Extract base symbol from all open trades and match exactly with baseSym
+            const [allOpenMcxTrades] = await db.execute(
+                `SELECT type, symbol, COALESCE(SUM(qty), 0) as total_qty
+                 FROM trades
+                 WHERE user_id = ? AND status = "OPEN" AND market_type = "MCX"
+                 GROUP BY type, symbol`,
+                [targetUserId]
             );
+
+            let openBaseTrades = [];
+            for (const trade of allOpenMcxTrades) {
+                const tradeBaseSym = getMcxBaseScrip(trade.symbol) || trade.symbol.toUpperCase();
+                if (tradeBaseSym === baseSym) {
+                    openBaseTrades.push({
+                        type: trade.type,
+                        total_qty: trade.total_qty
+                    });
+                }
+            }
 
             let currentOpenBuyQty = 0;
             let currentOpenSellQty = 0;

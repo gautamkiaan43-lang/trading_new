@@ -116,16 +116,7 @@ class MarginService {
       const marginField = tradeType === 'HOLDING' ? 'HOLDING' : 'INTRADAY';
       const marginPerLot = marginConfig[marginField] || 0;
 
-      if (marginPerLot <= 0) {
-        console.warn(`[MarginService] ${marginField} margin per lot is unconfigured, falling back to turnover exposure calculation`);
-        const exposureField = tradeType === 'HOLDING' ? 'holdingExposure' : 'intradayExposure';
-        const exposure = marginConfig[exposureField] || (tradeType === 'HOLDING' ? 100 : 500);
-        const turnover = priceNum * qtyNum * (lotSize || 1);
-        const requiredMargin = turnover / exposure;
-        console.log(`[MarginService] ✅ PER_LOT_BASIS Fallback (${tradeType}): turnover ₹${turnover.toFixed(2)} / ${exposure} = ₹${requiredMargin.toFixed(2)}`);
-        return requiredMargin;
-      }
-
+      // Use the value as-is (even if 0) - no fallback to exposure
       const requiredMargin = qtyNum * marginPerLot;
 
       console.log(`[MarginService] ✅ PER_LOT_BASIS (${tradeType}): qty=${qtyNum} × ₹${marginPerLot} = ₹${requiredMargin.toFixed(2)}`);
