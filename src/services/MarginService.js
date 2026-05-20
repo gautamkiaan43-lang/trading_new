@@ -61,14 +61,23 @@ class MarginService {
     }
 
     // Normalize config to include exposureType
+    // FIX: Handle zero values correctly - don't use || for zero values
     const normalized = {
-      exposureType: normalizedExposureType,  // ✅ USE REQUEST VALUE!
+      exposureType: normalizedExposureType,
       // Per Lot fields
-      INTRADAY: parseFloat(config.INTRADAY || config.intraday_margin || 0),
-      HOLDING: parseFloat(config.HOLDING || config.holding_margin || 0),
+      INTRADAY: parseFloat(
+        config.INTRADAY !== undefined ? config.INTRADAY : (config.intraday_margin || 0)
+      ),
+      HOLDING: parseFloat(
+        config.HOLDING !== undefined ? config.HOLDING : (config.holding_margin || 0)
+      ),
       // Per Turnover fields (global)
-      intradayExposure: parseFloat(clientConfig.mcxIntradayMargin || 500),
-      holdingExposure: parseFloat(clientConfig.mcxHoldingMargin || 100),
+      intradayExposure: parseFloat(
+        clientConfig.mcxIntradayMargin !== undefined ? clientConfig.mcxIntradayMargin : 500
+      ),
+      holdingExposure: parseFloat(
+        clientConfig.mcxHoldingMargin !== undefined ? clientConfig.mcxHoldingMargin : 100
+      ),
       // Lot size
       LOT: parseFloat(config.LOT || config.lot || 1)
     };

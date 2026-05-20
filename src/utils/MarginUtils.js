@@ -22,9 +22,12 @@ const MarginUtils = {
 
                 // Priority 1: Scrip-specific Lot-wise HOLDING Margin (Fixed Amount or Exposure)
                 const scripConfig = brokerMargins[upperSym] || brokerMargins[baseScrip];
-                const holdingMarginValue = parseFloat(scripConfig?.HOLDING || scripConfig?.holding_exposure);
+                // FIX: Handle 0 correctly - don't use || for zero values
+                const holdingMarginValue = parseFloat(
+                    scripConfig?.HOLDING !== undefined ? scripConfig.HOLDING : scripConfig?.holding_exposure
+                );
 
-                if (holdingMarginValue !== undefined && holdingMarginValue >= 0) {  // Allow 0!
+                if (Number.isFinite(holdingMarginValue) && holdingMarginValue >= 0) {  // Allow 0!
                     // If it's a fixed amount per lot (usually > 1000) or exposure divisor (usually 100)
                     if (holdingMarginValue > 500) {
                         // Fixed Amount per lot
