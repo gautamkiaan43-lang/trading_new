@@ -1456,7 +1456,7 @@ const placeOrder = async (req, res) => {
 const getTrades = async (req, res) => {
     const { status, user_id } = req.query; // OPEN, CLOSED, DELETED, CANCELLED
     try {
-        let query = 'SELECT t.*, u.username FROM trades t JOIN users u ON t.user_id = u.id WHERE 1=1';
+        let query = 'SELECT t.*, u.username, uc.username as created_by_name FROM trades t JOIN users u ON t.user_id = u.id LEFT JOIN users uc ON t.created_by = uc.id WHERE 1=1';
         const params = [];
 
         if (status) {
