@@ -861,10 +861,11 @@ const placeOrder = async (req, res) => {
             console.log(`[placeOrder] ⚠️  Using fallback margin: ₹${marginRequired.toFixed(2)} (${exposureTypeUsed})`);
         }
 
-        // Ensure margin is calculated
-        if (marginRequired <= 0) {
+        // Ensure margin is calculated (but allow 0 if user set it intentionally)
+        if (marginRequired < 0) {
             marginRequired = (executionPrice * qtyNum * lotSize) * 0.1; // 10% default
         }
+        // If marginRequired = 0, it's valid (user set 0 margin intentionally)
 
         // 8. Balance Check with calculated margin
         if (targetUser.balance < marginRequired) {
