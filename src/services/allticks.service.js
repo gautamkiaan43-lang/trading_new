@@ -1,14 +1,20 @@
 /**
  * AllTick Integration Service
  * ───────────────────────────
- * Realtime Forex & Crypto quotes via AllTick API.
+ * Realtime Forex & Crypto quotes via AllTick API with real bid/ask spreads.
  *
- * Primary:  WebSocket  wss://quote.alltick.co/quote-b-ws-api?token=TOKEN
- * Fallback: HTTP Poll  https://quote.alltick.co/quote-b-api/trade-tick?token=TOKEN&query=...
+ * Primary:  WebSocket  wss://quote.alltick.io/quote-b-ws-api?token=TOKEN
+ * Fallback: HTTP Poll  https://quote.alltick.io/quote-b-api/depth-tick?token=TOKEN&query=...
  *
- * API Protocol (confirmed from AllTick docs):
+ * API Protocol:
+ *   depth-tick endpoint provides:
+ *     - bids: array of {price, volume} (best bid first)
+ *     - asks: array of {price, volume} (best ask first)
+ *     - Real market depth data, not calculated spreads
+ *
+ * WebSocket (optional):
  *   Subscribe   → cmd_id 22004, symbol field: "code"
- *   Push ticks  ← cmd_id 22998, identifier field: "code", price field: "price"
+ *   Push ticks  ← cmd_id 22998
  *   Heartbeat   → cmd_id 22000 | Pong ← cmd_id 22001
  */
 
@@ -17,8 +23,8 @@ const axios = require('axios');
 const { formatForexData } = require('../utils/forexFormatter');
 const { formatCryptoData } = require('../utils/cryptoFormatter');
 
-const WS_URL         = 'wss://quote.alltick.co/quote-b-ws-api';
-const HTTP_TICK_URL  = 'https://quote.alltick.co/quote-b-api/trade-tick';
+const WS_URL         = 'wss://quote.alltick.io/quote-b-ws-api';
+const HTTP_DEPTH_URL = 'https://quote.alltick.io/quote-b-api/depth-tick';
 
 class AllTickService {
     constructor() {
@@ -33,6 +39,7 @@ class AllTickService {
 
         this.token = null;
 
+        // Default fallback symbols (will be overridden by DB symbols)
         this.forexSymbols = [
             'AUDCAD', 'EURINR', 'EURUSD', 'GBPINR', 'GBPUSD',
             'USDCHF', 'USDINR', 'USDJPY', 'XAGUSD', 'XAUUSD'
@@ -47,11 +54,48 @@ class AllTickService {
         this.prevCloseCache = {};
     }
 
+    // Load symbols from database (dynamic, not hardcoded)
+    async _loadSymbolsFromDb() {
+        try {
+            const db = require('../config/db');
+
+            // Load Forex symbols from DB and convert to AllTick format
+            const [forexRows] = await db.execute(`
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
+                WHERE mg.name = 'FOREX'
+            `);
+            if (forexRows.length > 0) {
+                this.forexSymbols = forexRows.map(r => {
+                    // Convert EUR/USD → EURUSD format for AllTick
+                    return (r.symbol || '').replace(/\//g, '');
+                }).filter(Boolean);
+            }
+
+            // Load Crypto symbols from DB and convert to AllTick format
+            const [cryptoRows] = await db.execute(`
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
+                WHERE mg.name = 'CRYPTO'
+            `);
+            if (cryptoRows.length > 0) {
+                this.cryptoSymbols = cryptoRows.map(r => {
+                    // Convert BTC/USD → BTCUSDT format for AllTick
+                    const sym = (r.symbol || '').replace(/\/USD$/i, 'USDT').replace(/\//g, '');
+                    return sym;
+                }).filter(Boolean);
+            }
+        } catch (err) {
+            console.error('[ALLTICKS] Failed to load symbols from DB:', err.message);
+            // Will use hardcoded fallbacks
+        }
+    }
+
     // ─────────────────────────────────────────────────────────
     //  Public API
     // ─────────────────────────────────────────────────────────
 
-    start() {
+    async start() {
         this.token = process.env.ALLTICKS_API_KEY;
         if (!this.token) {
             console.log('[ALLTICKS] ALLTICKS_API_KEY not set — service idle.');
@@ -59,7 +103,11 @@ class AllTickService {
         }
         if (this.isRunning) return;
         this.isRunning = true;
-        console.log('[ALLTICKS] Starting AllTick Integration Service (Forex + Crypto)...');
+
+        // Load symbols from database first (replaces hardcoded list)
+        await this._loadSymbolsFromDb();
+
+        console.log(`[ALLTICKS] Starting AllTick Integration Service - Crypto: ${this.cryptoSymbols.length}, Forex: ${this.forexSymbols.length}`);
         // Always run HTTP polling (5s) as primary source.
         // WS is attempted in parallel — if it delivers ticks they override HTTP data.
         // This handles plans where WS connects but sends no ticks.
@@ -245,21 +293,45 @@ class AllTickService {
         const isCrypto = this.cryptoSymbols.includes(symbol);
         if (!isForex && !isCrypto) return;
 
-        // AllTick trade-tick only provides "price" (last transaction price)
-        // bid = ask = price since no order book in trade-tick
-        const price = parseFloat(tick.price || 0);
-        if (!price || isNaN(price)) return;
+        // Extract bid from bids array (best bid = first element)
+        let bid = 0;
+        if (Array.isArray(tick.bids) && tick.bids.length > 0) {
+            bid = parseFloat(tick.bids[0].price || 0);
+        }
+
+        // Extract ask from asks array (best ask = first element)
+        let ask = 0;
+        if (Array.isArray(tick.asks) && tick.asks.length > 0) {
+            ask = parseFloat(tick.asks[0].price || 0);
+        }
+
+        // Calculate LTP as average of bid/ask (or use mid-price)
+        let ltp = bid && ask ? (bid + ask) / 2 : (bid || ask || 0);
+        if (!ltp || isNaN(ltp)) return;
 
         if (!this.prevCloseCache[symbol]) {
-            this.prevCloseCache[symbol] = price;
+            this.prevCloseCache[symbol] = ltp;
+        }
+
+        // Calculate total volume from bids + asks
+        let totalVolume = 0;
+        if (Array.isArray(tick.bids)) {
+            tick.bids.forEach(b => {
+                totalVolume += parseFloat(b.volume || 0);
+            });
+        }
+        if (Array.isArray(tick.asks)) {
+            tick.asks.forEach(a => {
+                totalVolume += parseFloat(a.volume || 0);
+            });
         }
 
         const dataToFormat = {
-            bid:           price,
-            ask:           price,
-            ltp:           price,
+            bid,
+            ask,
+            ltp,
             previousClose: this.prevCloseCache[symbol],
-            volume:        tick.volume || tick.vol || '-',
+            volume:        totalVolume > 0 ? totalVolume : '-',
             change:        0
         };
 
@@ -318,15 +390,16 @@ class AllTickService {
 
     // ─────────────────────────────────────────────────────────
     //  HTTP Polling Fallback
-    //  Uses trade-tick endpoint: GET /quote-b-api/trade-tick
+    //  Uses depth-tick endpoint: GET /quote-b-api/depth-tick
+    //  Returns real bid/ask from order book (bids + asks arrays)
     //  query param = URL-encoded JSON
     // ─────────────────────────────────────────────────────────
 
     _startPolling() {
         if (this.pollingInterval) return;
-        console.log('[ALLTICKS] Starting HTTP polling (trade-tick, 5s interval)...');
+        console.log('[ALLTICKS] Starting HTTP polling (depth-tick, 1s interval)...');
         this._poll();
-        this.pollingInterval = setInterval(() => this._poll(), 5000);
+        this.pollingInterval = setInterval(() => this._poll(), 1000);
     }
 
     _stopPolling() {
@@ -346,7 +419,7 @@ class AllTickService {
         });
 
         try {
-            const response = await axios.get(HTTP_TICK_URL, {
+            const response = await axios.get(HTTP_DEPTH_URL, {
                 params:  { token: this.token, query },
                 timeout: 5000
             });

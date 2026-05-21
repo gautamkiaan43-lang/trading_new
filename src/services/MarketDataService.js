@@ -41,7 +41,6 @@ class MarketDataService extends EventEmitter {
         this.broadcastInterval = 150; // ms
         this.broadcastTimer = null;
 
-        this._loadSymbolsFromDb();
         this._startBroadcastLoop();
     }
 
@@ -129,6 +128,9 @@ class MarketDataService extends EventEmitter {
         if (this.isConnecting) return;
         this.isConnecting = true;
         try {
+            // Load crypto/forex symbols from DB first (required for AllTicks data)
+            await this._loadSymbolsFromDb();
+
             const repo = require('../repositories/KiteRepository');
             const kiteService = require('../utils/kiteService');
             const userSession = await repo.getSessionByUserId(userId);
@@ -347,9 +349,8 @@ class MarketDataService extends EventEmitter {
         this._startCryptoForexPush();
     }
 
-    // Push full crypto + forex lists to all socket clients every 5s.
-    // This fills the frontend even when the initial snapshot was empty
-    // (AllTick hadn't delivered any ticks yet at snapshot time).
+    // Push full crypto + forex lists to all socket clients every 1s.
+    // Real-time updates for market watch.
     _startCryptoForexPush() {
         if (this._cfPushTimer) return;
         this._cfPushTimer = setInterval(() => {
@@ -361,7 +362,7 @@ class MarketDataService extends EventEmitter {
                 if (crypto.length > 0) io.emit('market_data_update', { type: 'crypto', data: crypto });
                 if (forex.length > 0)  io.emit('market_data_update', { type: 'forex',  data: forex  });
             } catch (_) {}
-        }, 5000);
+        }, 1000);
     }
 
     stopCryptoForex() {

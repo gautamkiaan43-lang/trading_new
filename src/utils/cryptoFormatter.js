@@ -30,9 +30,9 @@ const formatCryptoData = (instrument, data) => {
     return {
         instrument: formattedInstrument,
         type: "CRYPTO",
-        bid: parseFloat(bid.toFixed(2)),
-        ask: parseFloat(ask.toFixed(2)),
-        ltp: parseFloat(ltp.toFixed(2)),
+        bid: parseFloat(bid.toFixed(8)),
+        ask: parseFloat(ask.toFixed(8)),
+        ltp: parseFloat(ltp.toFixed(8)),
         expiry: "-",
         strike: "-",
         opt: "-",

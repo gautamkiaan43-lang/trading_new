@@ -31,9 +31,9 @@ const formatForexData = (instrument, data) => {
     return {
         instrument: formattedInstrument,
         type: "FOREX",
-        bid: parseFloat(bid.toFixed(5)),
-        ask: parseFloat(ask.toFixed(5)),
-        ltp: parseFloat(ltp.toFixed(5)),
+        bid: parseFloat(bid.toFixed(6)),
+        ask: parseFloat(ask.toFixed(6)),
+        ltp: parseFloat(ltp.toFixed(6)),
         expiry: "-",
         strike: "-",
         opt: "-",
