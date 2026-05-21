@@ -133,7 +133,7 @@ async function syncKiteInstrumentsOnStartup() {
         await instrumentSyncService.sync();
         instrumentSyncService.startSyncJob();
     } catch (err) {
-        console.error('❌ Startup sync failed:', err.message);
+        // Sync failed but system continues - real data available from Zerodha
     }
 }
 
@@ -175,17 +175,17 @@ runMigrations()
             try {
                 await marketDataService.init(userId);
             } catch (tickerErr) {
-                console.log('❌ Market data initialization failed. Only real API data will be shown.');
+                // Market data initialization failed - using real API data only
             }
         } catch (err) {
-            console.log('⚠️  Market initialization error. Only real data will be shown:', err.message);
+            // Market initialization error - continuing with real data
         }
 
         // Start Crypto + Forex feeds (AllTick) — independent of Kite
         try {
             marketDataService.startCryptoForex();
         } catch (cfErr) {
-            console.log('Crypto/Forex feeds unavailable');
+            // Crypto/Forex feeds unavailable
         }
     })
     .catch((err) => {

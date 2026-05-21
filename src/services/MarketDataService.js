@@ -75,8 +75,6 @@ class MarketDataService extends EventEmitter {
                 newMeta[r.symbol] = { name: r.name, category: r.category };
             });
             SYMBOL_META = newMeta;
-
-            console.log(`✅ Loaded ${CRYPTO_SYMBOLS_LIST.length} Crypto, ${FOREX_SYMBOLS_LIST.length} Forex, and ${Object.keys(SYMBOL_META).length} Meta entries from DB`);
         } catch (err) {
             console.error('❌ Failed to load market data symbols from DB:', err.message);
         }
@@ -145,7 +143,6 @@ class MarketDataService extends EventEmitter {
 
             // 2. Avoid re-initializing if already connected with the same token
             if (this.ticker && this.ticker.connected && this.currentToken === activeToken) {
-                console.log('✅ Zerodha already connected with active token.');
                 this.isConnecting = false;
                 return;
             }
@@ -166,7 +163,6 @@ class MarketDataService extends EventEmitter {
             }
 
             this.currentToken = activeToken;
-            console.log(`🔌 Initializing KiteTicker with token: ${activeToken.substring(0, 6)}...`);
 
             const currentTicker = new KiteTicker({
                 api_key: process.env.KITE_API_KEY,
@@ -179,8 +175,6 @@ class MarketDataService extends EventEmitter {
             let errorOccurred = false;
 
             currentTicker.on('connect', () => {
-                console.log('✅ Zerodha Ticker Connected');
-
                 const INDEX_TOKENS = [
                     { token: 256265, symbol: 'NSE:NIFTY 50' },
                     { token: 260105, symbol: 'NSE:NIFTY BANK' },
@@ -198,7 +192,6 @@ class MarketDataService extends EventEmitter {
                     try {
                         currentTicker.subscribe(tokenNums);
                         currentTicker.setMode(currentTicker.modeFull, tokenNums);
-                        console.log(`📊 Subscribed to ${tokenNums.length} tokens including NSE Indices`);
                     } catch (subErr) {
                         console.error('⚠️ Subscribe error on connect:', subErr.message);
                     }
@@ -224,7 +217,6 @@ class MarketDataService extends EventEmitter {
             });
 
             currentTicker.on('disconnect', () => {
-                console.log('🔌 Zerodha Ticker Disconnected');
                 if (this.ticker === currentTicker && !errorOccurred) {
                     // Only null it if it's the current active ticker and it wasn't a fatal error
                     // Actually, if autoReconnect is on, we might not want to null it here.
@@ -232,7 +224,6 @@ class MarketDataService extends EventEmitter {
             });
 
             currentTicker.on('noreconnect', () => {
-                console.log('⛔ Zerodha Ticker: Max reconnect attempts reached');
                 if (this.ticker === currentTicker) {
                     this.ticker = null;
                     this.currentToken = null;
@@ -341,7 +332,7 @@ class MarketDataService extends EventEmitter {
     }
 
     startMockEngine() {
-        console.log('ℹ️ Mock Engine requested but disabled in favor of real feeds.');
+        // Mock engine disabled - using real feeds only
     }
 
     stopMockEngine() {
@@ -352,7 +343,6 @@ class MarketDataService extends EventEmitter {
     // ══════════════════════════════════════════════════════
 
     async startCryptoForex() {
-        console.log('🌐 Starting Forex + Crypto feeds via AllTick');
         allTicksService.start();
         this._startCryptoForexPush();
     }
@@ -376,7 +366,6 @@ class MarketDataService extends EventEmitter {
 
     stopCryptoForex() {
         allTicksService.stop();
-        console.log('🛑 Stopped Forex + Crypto feeds');
     }
 
     getPrice(symbol) {

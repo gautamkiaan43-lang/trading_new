@@ -79,9 +79,7 @@ class SocketManager {
                             dashboard = await kiteRoutes.buildKiteDashboardPayload(userId);
                         }
                     } catch (dashErr) {
-                        if (dashErr.message !== 'KITE_NOT_CONNECTED') {
-                            console.warn('market_snapshot dashboard:', dashErr.message);
-                        }
+                        // Dashboard build failed, skip it silently
                     }
 
                     socket.emit('market_snapshot', {
@@ -129,7 +127,7 @@ class SocketManager {
                             });
                         })
                         .catch((e) => {
-                            console.error('Market subscription batch failed:', e.message);
+                            // Subscription batch failed, service will retry
                         });
                 }
             });
@@ -152,7 +150,6 @@ class SocketManager {
      */
     broadcastMarketSnapshotRefresh() {
         if (this.io) {
-            console.log('📢 Broadcasting market snapshot refresh to all clients...');
             this.io.emit('market_snapshot_needed');
         }
     }

@@ -27,8 +27,6 @@ async function initializeDefaultExclusions() {
         excludedContracts = nseNfoSymbols;
         global.EXCLUDED_CONTRACTS = excludedContracts;
 
-        console.log(`[contractController] Default exclusions initialized: ${nseNfoSymbols.length} NSE/NFO symbols disabled, MCX enabled`);
-
         // Save to file
         fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(excludedContracts, null, 2));
     } catch (err) {
@@ -42,9 +40,7 @@ function loadExcludedContracts() {
             const data = fs.readFileSync(EXCLUDED_FILE, 'utf8');
             excludedContracts = JSON.parse(data) || [];
             global.EXCLUDED_CONTRACTS = excludedContracts;
-            console.log(`[contractController] Loaded ${excludedContracts.length} excluded contracts`);
         } else {
-            console.log('[contractController] No exclusion file found. Will initialize defaults on first API call.');
             excludedContracts = [];
             global.EXCLUDED_CONTRACTS = [];
         }
@@ -144,7 +140,6 @@ async function _loadLiveNfoBases() {
         `);
         const all = rows.map(r => String(r.symbol || '').trim().toUpperCase()).filter(Boolean);
         _liveNfoBases = new Set(all);
-        console.log(`[contractController] Live NFO bases loaded: ${_liveNfoBases.size}`);
     } catch (err) {
         console.warn('[contractController] Could not load NFO bases from DB:', err.message);
         _liveNfoBases = new Set(NFO_WATCH_BASES.map(s => s.toUpperCase()));
@@ -164,7 +159,6 @@ global.WATCHLIST_CONFIG_VERSION = Date.now();
 
 function _bustWatchlistCache() {
     global.WATCHLIST_CONFIG_VERSION = Date.now();
-    console.log('🔄 Watchlist Config Version Updated:', global.WATCHLIST_CONFIG_VERSION);
 }
 
 // Get all available contracts
