@@ -179,32 +179,67 @@ function generateSuggestions(allContracts, excludedContracts) {
 
             // Find next contract in same group (next expiry)
             const next = contracts[idx + 1];
-            if (!next) return; // no next expiry to suggest
 
             const currentSymbol = current.symbol || `${seg}:${current.trading_symbol || current.tradingsymbol}`;
-            const nextSymbol = next.symbol || `${seg}:${next.trading_symbol || next.tradingsymbol}`;
-
             const isCurrentActive = !excludedContracts.includes(currentSymbol);
+
             // Only suggest if current is active
             if (!isCurrentActive) return;
 
-            const isNextActive = !excludedContracts.includes(nextSymbol);
+            // Determine status and message
+            let status = 'READY';
+            let statusMessage = '✅ Next is Active';
+            let nextSymbol = null;
+            let nextDisplay = null;
+            let nextExpiry = null;
+            let isNextActive = false;
+            let showDisableButton = true;
+
+            if (!next) {
+                // Next contract not available yet
+                status = 'WAITING';
+                statusMessage = '⏳ Next contract not yet available';
+                showDisableButton = false;
+            } else {
+                nextSymbol = next.symbol || `${seg}:${next.trading_symbol || next.tradingsymbol}`;
+                nextDisplay = next.trading_symbol || next.tradingsymbol || nextSymbol;
+                nextExpiry = next._expiryDate.toISOString().split('T')[0];
+                isNextActive = !excludedContracts.includes(nextSymbol);
+
+                if (isNextActive) {
+                    statusMessage = '✅ Next is Active';
+                } else {
+                    statusMessage = '⚠️ Next contract available but not active';
+                }
+            }
+
+            // If contract is already hidden/expired, don't show disable button
+            if (days <= -1) {
+                showDisableButton = false;
+                statusMessage = '🔴 Contract Expired (Auto-Disabled)';
+            } else if (days === 0 && isMarketClosed(seg)) {
+                showDisableButton = false;
+                statusMessage = '🔴 Contract Expired (Auto-Disabled)';
+            }
 
             suggestions.push({
                 current_contract: currentSymbol,
                 current_display: current.trading_symbol || current.tradingsymbol || currentSymbol,
                 next_contract: nextSymbol,
-                next_display: next.trading_symbol || next.tradingsymbol || nextSymbol,
+                next_display: nextDisplay,
                 base_name: baseName,
                 days_remaining: days,
                 current_expiry: current._expiryDate.toISOString().split('T')[0],
-                next_expiry: next._expiryDate.toISOString().split('T')[0],
+                next_expiry: nextExpiry,
                 segment: seg,
                 instrument_type: instrType,
                 rollover_type: rolloverType(seg, instrType),
                 recommended_action: 'ENABLE_NEXT_EXPIRY',
                 next_already_active: isNextActive,
-                urgency: days <= 0 ? 'EXPIRED' : days <= 1 ? 'CRITICAL' : 'WARNING'
+                urgency: days <= 0 ? 'EXPIRED' : days <= 1 ? 'CRITICAL' : 'WARNING',
+                status: status,
+                status_message: statusMessage,
+                show_disable_button: showDisableButton
             });
         });
     });
