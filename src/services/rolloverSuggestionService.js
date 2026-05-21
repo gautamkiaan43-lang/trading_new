@@ -30,6 +30,13 @@ const THRESHOLD = {
     NSE: 2,   // NSE Futures           — 2 days
 };
 
+// ── Market close times (IST) ──────────────────────────────────────────────────
+const MARKET_CLOSE_TIME = {
+    MCX: { hour: 23, minute: 30 },  // MCX closes at 11:30 PM IST
+    NFO: { hour: 15, minute: 30 },  // NFO closes at 3:30 PM IST
+    NSE: { hour: 15, minute: 30 },  // NSE closes at 3:30 PM IST
+};
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -59,6 +66,23 @@ function daysRemaining(expiryDate) {
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const expDay = new Date(expiryDate.getFullYear(), expiryDate.getMonth(), expiryDate.getDate());
     return Math.ceil((expDay - today) / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * Check if market is closed for a given segment (IST time).
+ * Returns true if market has closed for the day.
+ */
+function isMarketClosed(segment) {
+    const now = new Date();
+    const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const currentHour = istTime.getHours();
+    const currentMin = istTime.getMinutes();
+
+    const closeTime = MARKET_CLOSE_TIME[segment] || MARKET_CLOSE_TIME.NSE;
+
+    // Market is closed if current time >= close time
+    return (currentHour > closeTime.hour) ||
+           (currentHour === closeTime.hour && currentMin >= closeTime.minute);
 }
 
 /**
@@ -145,7 +169,13 @@ function generateSuggestions(allContracts, excludedContracts) {
         contracts.forEach((current, idx) => {
             const days = daysRemaining(current._expiryDate);
             if (days > threshold) return; // not near expiry
-            if (days < -1) return;       // already expired by more than 1 day — skip
+
+            // Hide contract ONLY AFTER market closes on expiry day
+            // If days === 0 (today is expiry) but market is still open → SHOW
+            // If days === 0 and market closed → HIDE
+            // If days < -1 (expired >1 day ago) → HIDE
+            const shouldHide = (days < -1) || (days === 0 && isMarketClosed(seg));
+            if (shouldHide) return;
 
             // Find next contract in same group (next expiry)
             const next = contracts[idx + 1];
