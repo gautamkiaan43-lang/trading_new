@@ -194,6 +194,7 @@ function generateSuggestions(allContracts, excludedContracts) {
             let nextExpiry = null;
             let isNextActive = false;
             let showDisableButton = true;
+            let currentExists = true; // Check if current contract is available
 
             if (!next) {
                 // Next contract not available yet
@@ -216,10 +217,18 @@ function generateSuggestions(allContracts, excludedContracts) {
             // If contract is already hidden/expired, don't show disable button
             if (days <= -1) {
                 showDisableButton = false;
+                currentExists = false;
                 statusMessage = '🔴 Contract Expired (Auto-Disabled)';
             } else if (days === 0 && isMarketClosed(seg)) {
                 showDisableButton = false;
+                currentExists = false;
                 statusMessage = '🔴 Contract Expired (Auto-Disabled)';
+            }
+
+            // If current contract doesn't exist in available contracts, hide disable button
+            // (Already not in market watch = already disabled effectively)
+            if (!currentExists || !isCurrentActive) {
+                showDisableButton = false;
             }
 
             suggestions.push({
