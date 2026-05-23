@@ -42,7 +42,7 @@ class AllTickService {
         // Default fallback symbols (will be overridden by DB symbols)
         this.forexSymbols = [
             'AUDCAD', 'EURINR', 'EURUSD', 'GBPINR', 'GBPUSD',
-            'USDCHF', 'USDINR', 'USDJPY', 'XAGUSD', 'XAUUSD'
+            'USDCHF', 'USDINR', 'USDJPY', 'Silver', 'XAUUSD'
         ];
         // AllTick crypto symbols use USDT suffix (not USD)
         this.cryptoSymbols = [
@@ -67,8 +67,13 @@ class AllTickService {
             `);
             if (forexRows.length > 0) {
                 this.forexSymbols = forexRows.map(r => {
+                    const sym = r.symbol || '';
+                    // Special cases for commodity codes that don't follow standard format
+                    if (sym === 'XAG/USD') {
+                        return 'Silver';  // XAG/USD → Silver (AllTicks code)
+                    }
                     // Convert EUR/USD → EURUSD format for AllTick
-                    return (r.symbol || '').replace(/\//g, '');
+                    return sym.replace(/\//g, '');
                 }).filter(Boolean);
             }
 
@@ -137,16 +142,37 @@ class AllTickService {
         try {
             this.ws = new WebSocket(url);
 
-            // Handle non-101 upgrade responses (e.g. 401)
+            // Register error handler FIRST to prevent unhandled errors
+            this.ws.on('error', (err) => {
+                if (!this.wsDisabled) {
+                    console.error('[ALLTICKS] WS Error:', err.message);
+                    this.isWsConnected = false;
+                    this._startPolling();
+                }
+            });
+
+            // Handle non-101 upgrade responses (e.g. 401, 429)
             this.ws.on('unexpected-response', (req, res) => {
                 const code = res.statusCode;
                 if (code === 401) {
                     console.error('[ALLTICKS] WebSocket 401 Unauthorized — token invalid or plan does not include WS. Falling back to HTTP polling permanently.');
                     this.wsDisabled = true;
+                } else if (code === 429) {
+                    console.warn(`[ALLTICKS] WebSocket 429 Rate Limited. Using HTTP polling instead.`);
                 } else {
                     console.error(`[ALLTICKS] WebSocket upgrade failed with HTTP ${code}. Falling back to HTTP polling.`);
                 }
-                this._closeWs();
+                if (this.ws) {
+                    this.ws.removeAllListeners();
+                    try {
+                        if (this.ws.readyState === 0 || this.ws.readyState === 1) {
+                            this.ws.close();
+                        }
+                    } catch (closeErr) {
+                        // WebSocket already closed or in invalid state
+                    }
+                    this.ws = null;
+                }
                 this._startPolling();
             });
 
@@ -154,7 +180,6 @@ class AllTickService {
                 console.log('[ALLTICKS] WebSocket Connected');
                 this.isWsConnected    = true;
                 this.reconnectAttempts = 0;
-                // Keep HTTP polling running — WS may connect but not deliver ticks on limited plans
                 this._subscribe();
                 this._startHeartbeat();
             });
@@ -164,15 +189,6 @@ class AllTickService {
                     const msg = JSON.parse(raw.toString());
                     this._handleWsMessage(msg);
                 } catch (_) {}
-            });
-
-            this.ws.on('error', (err) => {
-                // 401 is caught by unexpected-response; this handles other errors
-                if (!this.wsDisabled) {
-                    console.error('[ALLTICKS] WS Error:', err.message);
-                    this.isWsConnected = false;
-                    this._startPolling();
-                }
             });
 
             this.ws.on('close', () => {
@@ -209,7 +225,12 @@ class AllTickService {
 
     _closeWs() {
         if (this.ws) {
-            try { this.ws.removeAllListeners(); this.ws.close(); } catch (_) {}
+            try {
+                this.ws.removeAllListeners();
+                if (this.ws.readyState !== 3) { // 3 = CLOSED
+                    this.ws.close();
+                }
+            } catch (_) {}
             this.ws = null;
         }
         this.isWsConnected = false;
@@ -383,6 +404,8 @@ class AllTickService {
                 name:       unslashedInstrument
             };
             mds.dirtySymbols.add(unslashedSymbol);
+
+            console.log(`[ALLTICKS] 📡 Broadcast: ${slashedSymbol} | Bid: ${item.bid} Ask: ${item.ask}`);
         } catch (err) {
             console.error('[ALLTICKS] Broadcast error:', err.message);
         }

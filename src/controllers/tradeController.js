@@ -201,24 +201,72 @@ const placeOrder = async (req, res) => {
         const qtyNum = parseInt(qty, 10);
 
         // 🚀 Robust Live Price Fetcher (prioritize MarketDataService, then direct Kite API)
-        // 🚀 Robust Live Price Fetcher (prioritize MarketDataService, then direct Kite API)
         let liveMarketPrice = null;
         const marketDataService = require('../services/MarketDataService');
         const kiteService = require('../utils/kiteService');
 
+        console.log(`[placeOrder] DEBUG - Received symbol: "${symbol}"`);
+
+        // Normalize symbol - remove double prefixes from frontend
+        let normalizedSymbol = symbol;
+        if (symbol.includes('CRYPTO:CRYPTO:') || symbol.includes('FOREX:FOREX:')) {
+            // Fix double prefix: CRYPTO:CRYPTO:ADA/USD → CRYPTO:ADA/USD
+            normalizedSymbol = symbol.replace('CRYPTO:CRYPTO:', 'CRYPTO:').replace('FOREX:FOREX:', 'FOREX:');
+            console.log(`[placeOrder] ✅ Fixed double prefix: "${symbol}" → "${normalizedSymbol}"`);
+        }
+
+        // Build search patterns - only add prefixes if not already present
+        const possibleSymbols = [];
+        if (!normalizedSymbol.includes(':')) {
+            // No prefix yet - add all variants
+            possibleSymbols.push(
+                normalizedSymbol,
+                `MCX:${normalizedSymbol}`,
+                `NSE:${normalizedSymbol}`,
+                `NFO:${normalizedSymbol}`,
+                `CRYPTO:${normalizedSymbol}`,
+                `CRYPTO:${normalizedSymbol.replace(/USDT$/i, '/USD')}`,
+                `FOREX:${normalizedSymbol}`
+            );
+        } else {
+            // Already has prefix - use as-is and try variants
+            possibleSymbols.push(normalizedSymbol);
+            // Also try normalized versions (slashed vs unslashed)
+            if (normalizedSymbol.includes('/')) {
+                possibleSymbols.push(normalizedSymbol.replace('/', '').replace(/USD$/, 'USDT'));
+            } else if (normalizedSymbol.endsWith('USDT')) {
+                const baseSym = normalizedSymbol.substring(0, normalizedSymbol.length - 4);
+                const prefix = normalizedSymbol.substring(0, normalizedSymbol.indexOf(':') + 1);
+                possibleSymbols.push(`${prefix}${baseSym}/USD`);
+            }
+        }
+
+        console.log(`[placeOrder] 🔍 Search patterns:`, possibleSymbols);
+        const allStoredKeys = Object.keys(marketDataService.prices || {});
+        const cryptoForexKeys = allStoredKeys.filter(k => k.includes('CRYPTO') || k.includes('FOREX'));
+        console.log(`[placeOrder] 📊 Total symbols in MarketDataService: ${allStoredKeys.length}`);
+        console.log(`[placeOrder] 📊 CRYPTO/FOREX symbols available: ${cryptoForexKeys.length}`, cryptoForexKeys.slice(0, 10));
+
         // 1. Try to get from MarketDataService with various prefixes
-        const possibleSymbols = [symbol, `MCX:${symbol}`, `NSE:${symbol}`, `NFO:${symbol}`];
         for (const s of possibleSymbols) {
             const liveData = marketDataService.getPrice(s);
             if (liveData && liveData.ltp) {
                 liveMarketPrice = liveData.ltp;
-                console.log(`[placeOrder] 🎯 Price found in MarketDataService for ${s}: ${liveMarketPrice}`);
+                console.log(`[placeOrder] ✅ Price found for "${s}": ${liveMarketPrice}`);
                 break;
             }
         }
 
-        // 2. If not in stream, try DIRECT QUOTE from Kite API (for NFO/NSE/MCX)
-        if (!liveMarketPrice && kiteService.isAuthenticated()) {
+        if (!liveMarketPrice) {
+            console.log(`[placeOrder] ❌ Price NOT found. Tried: ${possibleSymbols.join(', ')}`);
+            console.log(`[placeOrder] ❌ Market type: ${marketType}`);
+        }
+
+        // 2. For CRYPTO/FOREX from AllTicks, do NOT use Kite fallback
+        const isCryptoOrForex = marketType === 'CRYPTO' || marketType === 'FOREX';
+
+        // 3. If not in stream AND it's not crypto/forex, try DIRECT QUOTE from Kite API (for NFO/NSE/MCX only)
+        if (!liveMarketPrice && !isCryptoOrForex && kiteService.isAuthenticated()) {
             try {
                 console.log(`[placeOrder] 📡 Price not in stream, fetching direct quote for ${symbol}...`);
                 // Try to find the correct exchange prefix if not provided
@@ -247,9 +295,15 @@ const placeOrder = async (req, res) => {
             }
         }
 
-        // 3. Reject order if live price is unavailable (No Mock Fallback Allowed)
+        // 4. Reject order if live price is unavailable
         if (!liveMarketPrice) {
-            return res.status(400).json({ message: 'Kite Zerodha is not connected. Please login first.' });
+            if (isCryptoOrForex) {
+                return res.status(400).json({
+                    message: `AllTicks data for ${marketType} not available yet. Please wait a moment and try again.`
+                });
+            } else {
+                return res.status(400).json({ message: 'Live price not available. Please login to Zerodha and ensure the symbol is available.' });
+            }
         }
 
         const executionPrice = price ? parseFloat(price) : (order_type === 'MARKET' ? liveMarketPrice : 0);
@@ -655,7 +709,33 @@ const placeOrder = async (req, res) => {
             if (order_type !== 'MARKET' && price) {
                 // Get real price from MarketDataService or Kite (No Mock Fallback Allowed)
                 let currentPriceNow = null;
-                const searchPatterns = [symbol, `MCX:${symbol}`, `NFO:${symbol}`, `NSE:${symbol}`];
+
+                // Use normalized symbol for search
+                const searchSymbol = normalizedSymbol;
+
+                // Build search patterns - handle both prefixed and non-prefixed symbols
+                const searchPatterns = [];
+                if (!searchSymbol.includes(':')) {
+                    searchPatterns.push(
+                        searchSymbol,
+                        `MCX:${searchSymbol}`,
+                        `NFO:${searchSymbol}`,
+                        `NSE:${searchSymbol}`,
+                        `CRYPTO:${searchSymbol}`,
+                        `CRYPTO:${searchSymbol.replace(/USDT$/i, '/USD')}`,
+                        `FOREX:${searchSymbol}`
+                    );
+                } else {
+                    searchPatterns.push(searchSymbol);
+                    if (searchSymbol.includes('/')) {
+                        searchPatterns.push(searchSymbol.replace('/', '').replace(/USD$/, 'USDT'));
+                    } else if (searchSymbol.endsWith('USDT')) {
+                        const baseSym = searchSymbol.substring(0, searchSymbol.length - 4);
+                        const prefix = searchSymbol.substring(0, searchSymbol.indexOf(':') + 1);
+                        searchPatterns.push(`${prefix}${baseSym}/USD`);
+                    }
+                }
+
                 for (const p of searchPatterns) {
                     const data = marketDataService.getPrice(p);
                     if (data && data.ltp) {
@@ -1546,9 +1626,9 @@ const getTrades = async (req, res) => {
 
         const [rows] = await db.execute(query, params);
 
-        // --- ENHANCEMENT: Dynamic Margin for OPEN trades ---
+        // --- ENHANCEMENT: Dynamic Margin and P/L for OPEN trades ---
         // If we are listing OPEN trades, we should calculate the current "Holding Margin Required"
-        // to match the app's Portfolio display.
+        // and P/L based on live market prices.
         if (status === 'OPEN' || !status) {
             // Group by user to fetch configs once
             const userIds = [...new Set(rows.map(r => r.user_id))];
@@ -1563,10 +1643,39 @@ const getTrades = async (req, res) => {
                 // ✅ RECALCULATE: Dynamically calculate holding margin for OPEN trades
                 // This ensures margins reflect the latest configuration (e.g., zero margin settings)
                 const MarginUtils = require('../utils/MarginUtils');
+                const marketDataService = require('../services/MarketDataService');
                 rows.forEach(trade => {
                     const clientConfig = configMap[trade.user_id] || {};
                     const calc = MarginUtils.calculateTotalRequiredHoldingMargin([trade], clientConfig);
                     trade.margin_used = calc;
+
+                    // Calculate P/L dynamically for OPEN trades only if pnl is 0/null
+                    if (trade.status === 'OPEN' && (!trade.pnl || parseFloat(trade.pnl) === 0)) {
+                        const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
+                        const prefixForPnl = trade.market_type === 'EQUITY' ? 'NSE' : (trade.market_type === 'OPTIONS' ? 'NFO' : trade.market_type);
+                        const possibleSymbols = [trade.symbol, `${prefixForPnl}:${cleanSymbol}`, cleanSymbol];
+
+                        let currentPrice = null;
+                        for (const sym of possibleSymbols) {
+                            const data = marketDataService.getPrice(sym);
+                            if (data && data.ltp) {
+                                currentPrice = data.ltp;
+                                break;
+                            }
+                        }
+
+                        if (currentPrice) {
+                            const lotSize = parseFloat(trade.lot_size_at_entry || 1);
+                            const qtyForPnl = trade.qty * lotSize;
+                            const entryPrice = parseFloat(trade.entry_price);
+
+                            if (trade.type === 'BUY') {
+                                trade.pnl = (currentPrice - entryPrice) * qtyForPnl;
+                            } else {
+                                trade.pnl = (entryPrice - currentPrice) * qtyForPnl;
+                            }
+                        }
+                    }
                 });
             }
         }

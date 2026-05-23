@@ -20,7 +20,7 @@ const formatCryptoData = (instrument, data) => {
     const bid = parseFloat(data.bid || data.price || 0);
     const ask = parseFloat(data.ask || data.price || 0);
     const ltp = data.ltp || (bid + ask) / 2;
-    
+
     // Change calculation if not provided directly
     let change = data.change || 0;
     if (data.previousClose && data.previousClose !== 0) {
@@ -30,9 +30,9 @@ const formatCryptoData = (instrument, data) => {
     return {
         instrument: formattedInstrument,
         type: "CRYPTO",
-        bid: parseFloat(bid.toFixed(8)),
-        ask: parseFloat(ask.toFixed(8)),
-        ltp: parseFloat(ltp.toFixed(8)),
+        bid: bid,
+        ask: ask,
+        ltp: ltp,
         expiry: "-",
         strike: "-",
         opt: "-",

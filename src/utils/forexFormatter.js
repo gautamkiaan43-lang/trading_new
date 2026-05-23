@@ -7,8 +7,12 @@ const formatForexData = (instrument, data) => {
     // Ensure instrument is in format like "EUR/USD"
     let formattedInstrument = instrument;
     if (instrument && !instrument.includes('/')) {
+        // Special case: Silver -> XAG/USD (commodity code for silver)
+        if (instrument.toLowerCase() === 'silver') {
+            formattedInstrument = 'XAG/USD';
+        }
         // EURUSD -> EUR/USD
-        if (instrument.length === 6) {
+        else if (instrument.length === 6) {
             formattedInstrument = `${instrument.substring(0, 3)}/${instrument.substring(3)}`;
         } else if (instrument.endsWith('USD') || instrument.endsWith('INR')) {
             // XAUUSD -> XAU/USD
@@ -21,7 +25,7 @@ const formatForexData = (instrument, data) => {
     const bid = parseFloat(data.bid || data.price || 0);
     const ask = parseFloat(data.ask || data.price || 0);
     const ltp = data.ltp || (bid + ask) / 2;
-    
+
     // Change calculation if not provided directly
     let change = data.change || 0;
     if (data.previousClose && data.previousClose !== 0) {
@@ -31,9 +35,9 @@ const formatForexData = (instrument, data) => {
     return {
         instrument: formattedInstrument,
         type: "FOREX",
-        bid: parseFloat(bid.toFixed(6)),
-        ask: parseFloat(ask.toFixed(6)),
-        ltp: parseFloat(ltp.toFixed(6)),
+        bid: bid,
+        ask: ask,
+        ltp: ltp,
         expiry: "-",
         strike: "-",
         opt: "-",

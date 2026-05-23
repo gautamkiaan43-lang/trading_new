@@ -10,6 +10,44 @@ router.get('/ping', (req, res) => {
     res.json({ status: 'ok', timestamp: Date.now(), platform: 'Railway / Node.js' });
 });
 
+// Debug: Refresh market data cache (clears duplicates) - NO AUTH for quick fixes
+router.get('/debug/refresh-market-data', async (req, res) => {
+    try {
+        const marketDataService = require('../services/MarketDataService');
+        console.log('[DEBUG] Manual refresh triggered');
+        await marketDataService.refreshSymbolLists();
+        res.json({
+            status: 'success',
+            message: '✅ Market data refreshed - duplicates cleared',
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        console.error('[DEBUG] Refresh error:', err.message);
+        res.status(500).json({
+            status: 'error',
+            message: err.message
+        });
+    }
+});
+
+// Refresh market data cache (clears duplicates) - with auth
+router.post('/refresh-market-data', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN']), async (req, res) => {
+    try {
+        const marketDataService = require('../services/MarketDataService');
+        await marketDataService.refreshSymbolLists();
+        res.json({
+            status: 'success',
+            message: 'Market data refreshed, duplicates cleared',
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        res.status(500).json({
+            status: 'error',
+            message: err.message
+        });
+    }
+});
+
 router.get('/audit-log', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN']), getActionLedger);
 router.post('/global-update', authMiddleware, roleMiddleware(['SUPERADMIN']), globalBatchUpdate);
 router.get('/segment-values', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN']), getSegmentValues);

@@ -801,20 +801,17 @@ const runMigrations = async () => {
         { symbol: 'ADA/USD', name: 'Cardano', category: 'crypto' },
         { symbol: 'DOGE/USD', name: 'Dogecoin', category: 'crypto' },
         { symbol: 'DOT/USD', name: 'Polkadot', category: 'crypto' },
-        { symbol: 'MATIC/USD', name: 'Polygon', category: 'crypto' },
         { symbol: 'AVAX/USD', name: 'Avalanche', category: 'crypto' }
     ];
     const forex = [
-        { symbol: 'XAU/USD', name: 'Gold', category: 'commodity' },
-        { symbol: 'XAG/USD', name: 'Silver', category: 'commodity' },
+        { symbol: 'XAU/USD', name: 'Gold', category: 'forex' },
+        { symbol: 'XAG/USD', name: 'Silver', category: 'forex' },
         { symbol: 'USD/INR', name: 'USD/INR', category: 'forex' },
-        { symbol: 'EUR/INR', name: 'EUR/INR', category: 'forex' },
         { symbol: 'GBP/USD', name: 'GBP/USD', category: 'forex' },
         { symbol: 'USD/JPY', name: 'USD/JPY', category: 'forex' },
         { symbol: 'USD/CHF', name: 'USD/CHF', category: 'forex' },
         { symbol: 'AUD/CAD', name: 'AUD/CAD', category: 'forex' },
-        { symbol: 'EUR/USD', name: 'EUR/USD', category: 'forex' },
-        { symbol: 'GBP/INR', name: 'GBP/INR', category: 'forex' }
+        { symbol: 'EUR/USD', name: 'EUR/USD', category: 'forex' }
     ];
     const nseInd = [
         { symbol: 'NIFTY 50', name: 'NIFTY 50' },

@@ -50,23 +50,25 @@ class MarketDataService extends EventEmitter {
 
             // Load Crypto
             const [cryptoRows] = await db.execute(`
-                SELECT symbol FROM market_group_items mgi 
-                JOIN market_groups mg ON mgi.group_id = mg.id 
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
                 WHERE mg.name = 'CRYPTO'
             `);
             CRYPTO_SYMBOLS_LIST = cryptoRows.map(r => r.symbol);
+            console.log(`[MarketDataService] Loaded ${CRYPTO_SYMBOLS_LIST.length} crypto symbols from DB`);
 
             // Load Forex
             const [forexRows] = await db.execute(`
-                SELECT symbol FROM market_group_items mgi 
-                JOIN market_groups mg ON mgi.group_id = mg.id 
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
                 WHERE mg.name = 'FOREX'
             `);
             FOREX_SYMBOLS_LIST = forexRows.map(r => r.symbol);
+            console.log(`[MarketDataService] Loaded ${FOREX_SYMBOLS_LIST.length} forex symbols from DB`);
 
             // Load All Metadata
             const [metaRows] = await db.execute(`
-                SELECT symbol, name, category FROM market_group_items 
+                SELECT symbol, name, category FROM market_group_items
                 WHERE category IS NOT NULL
             `);
             const newMeta = {};
@@ -74,9 +76,33 @@ class MarketDataService extends EventEmitter {
                 newMeta[r.symbol] = { name: r.name, category: r.category };
             });
             SYMBOL_META = newMeta;
+            console.log(`[MarketDataService] Loaded ${Object.keys(SYMBOL_META).length} symbol metadata entries from DB`);
         } catch (err) {
             console.error('❌ Failed to load market data symbols from DB:', err.message);
         }
+    }
+
+    async refreshSymbolLists() {
+        console.log('[MarketDataService] ♻️ Refreshing symbol lists from database...');
+        await this._loadSymbolsFromDb();
+        // Also reload AllTicks symbols
+        await allTicksService._loadSymbolsFromDb();
+
+        // Clean up prices for symbols no longer in the list
+        const validSymbols = new Set();
+        CRYPTO_SYMBOLS_LIST.forEach(sym => validSymbols.add(`CRYPTO:${sym}`));
+        FOREX_SYMBOLS_LIST.forEach(sym => validSymbols.add(`FOREX:${sym}`));
+
+        let removedCount = 0;
+        Object.keys(this.prices).forEach(key => {
+            if ((key.startsWith('CRYPTO:') || key.startsWith('FOREX:')) && !validSymbols.has(key)) {
+                console.log(`[MarketDataService] Removing orphaned price: ${key}`);
+                delete this.prices[key];
+                removedCount++;
+            }
+        });
+
+        console.log(`[MarketDataService] ✅ Symbol lists refreshed (removed ${removedCount} orphaned entries)`);
     }
 
     /**
@@ -130,6 +156,7 @@ class MarketDataService extends EventEmitter {
         try {
             // Load crypto/forex symbols from DB first (required for AllTicks data)
             await this._loadSymbolsFromDb();
+            console.log(`[MarketDataService] init() - Crypto: ${CRYPTO_SYMBOLS_LIST.length}, Forex: ${FOREX_SYMBOLS_LIST.length}`);
 
             const repo = require('../repositories/KiteRepository');
             const kiteService = require('../utils/kiteService');
@@ -345,6 +372,8 @@ class MarketDataService extends EventEmitter {
     // ══════════════════════════════════════════════════════
 
     async startCryptoForex() {
+        // Refresh symbol lists from cleaned database before starting
+        await this.refreshSymbolLists();
         allTicksService.start();
         this._startCryptoForexPush();
     }
@@ -356,12 +385,40 @@ class MarketDataService extends EventEmitter {
         this._cfPushTimer = setInterval(() => {
             try {
                 const io = require('../websocket/SocketManager').getIo();
-                if (!io) return;
+                if (!io) {
+                    console.warn('WARN [CryptoForexPush] io instance is null/undefined');
+                    return;
+                }
                 const crypto = this.getCryptoPrices();
                 const forex  = this.getForexPrices();
-                if (crypto.length > 0) io.emit('market_data_update', { type: 'crypto', data: crypto });
-                if (forex.length > 0)  io.emit('market_data_update', { type: 'forex',  data: forex  });
-            } catch (_) {}
+
+                if (crypto.length === 0 && forex.length === 0) {
+                    console.warn('WARN [CryptoForexPush] No crypto or forex data available');
+                    return;
+                }
+
+                // DEBUG: Log what we're sending
+                if (crypto.length > 0) {
+                    console.log(`[socket] Sending crypto (${crypto.length}): ${crypto[0].symbol} | Bid: ${crypto[0].bid} Ask: ${crypto[0].ask} LTP: ${crypto[0].ltp}`);
+                    try {
+                        io.emit('market_data_update', { type: 'crypto', data: crypto });
+                        console.log(`[socket] Crypto broadcast emitted successfully`);
+                    } catch (emitErr) {
+                        console.error(`[socket] Failed to emit crypto data:`, emitErr.message);
+                    }
+                }
+                if (forex.length > 0) {
+                    console.log(`[socket] Sending forex (${forex.length}): ${forex[0].symbol} | Bid: ${forex[0].bid} Ask: ${forex[0].ask} LTP: ${forex[0].ltp}`);
+                    try {
+                        io.emit('market_data_update', { type: 'forex',  data: forex  });
+                        console.log(`[socket] Forex broadcast emitted successfully`);
+                    } catch (emitErr) {
+                        console.error(`[socket] Failed to emit forex data:`, emitErr.message);
+                    }
+                }
+            } catch (e) {
+                console.error('[CryptoForexPush] Error:', e.message);
+            }
         }, 1000);
     }
 
