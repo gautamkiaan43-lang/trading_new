@@ -19,7 +19,8 @@ const formatCryptoData = (instrument, data) => {
 
     const bid = parseFloat(data.bid || data.price || 0);
     const ask = parseFloat(data.ask || data.price || 0);
-    const ltp = data.ltp || (bid + ask) / 2;
+    // LTP priority: real trade-tick ltp > real price field > mid-price formula
+    const ltp = data.ltp || (data.price ? parseFloat(data.price) : 0) || (bid + ask) / 2;
 
     // Change calculation if not provided directly
     let change = data.change || 0;

@@ -23,18 +23,19 @@ const axios = require('axios');
 const { formatForexData } = require('../utils/forexFormatter');
 const { formatCryptoData } = require('../utils/cryptoFormatter');
 
-const WS_URL         = 'wss://quote.alltick.io/quote-b-ws-api';
+const WS_URL = 'wss://quote.alltick.io/quote-b-ws-api';
 const HTTP_DEPTH_URL = 'https://quote.alltick.io/quote-b-api/depth-tick';
+const HTTP_TRADE_URL = 'https://quote.alltick.io/quote-b-api/trade-tick'; // Real LTP endpoint
 
 class AllTickService {
     constructor() {
-        this.ws                   = null;
-        this.pollingInterval      = null;
-        this.heartbeatInterval    = null;
-        this.isRunning            = false;
-        this.isWsConnected        = false;
-        this.wsDisabled           = false; // set true on 401 — stop retrying WS
-        this.reconnectAttempts    = 0;
+        this.ws = null;
+        this.pollingInterval = null;
+        this.heartbeatInterval = null;
+        this.isRunning = false;
+        this.isWsConnected = false;
+        this.wsDisabled = false; // set true on 401 — stop retrying WS
+        this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
 
         this.token = null;
@@ -50,8 +51,9 @@ class AllTickService {
             'DOTUSDT', 'ETHUSDT', 'MATICUSDT', 'SOLUSDT', 'XRPUSDT'
         ];
 
-        this.cache         = {};
+        this.cache = {};
         this.prevCloseCache = {};
+        this.ltpCache = {}; // Real LTP from trade-tick endpoint
     }
 
     // Load symbols from database (dynamic, not hardcoded)
@@ -164,6 +166,7 @@ class AllTickService {
                 }
                 if (this.ws) {
                     this.ws.removeAllListeners();
+                    this.ws.on('error', () => { }); // Prevents unhandled error event on close
                     try {
                         if (this.ws.readyState === 0 || this.ws.readyState === 1) {
                             this.ws.close();
@@ -178,7 +181,7 @@ class AllTickService {
 
             this.ws.on('open', () => {
                 console.log('[ALLTICKS] WebSocket Connected');
-                this.isWsConnected    = true;
+                this.isWsConnected = true;
                 this.reconnectAttempts = 0;
                 this._subscribe();
                 this._startHeartbeat();
@@ -188,7 +191,7 @@ class AllTickService {
                 try {
                     const msg = JSON.parse(raw.toString());
                     this._handleWsMessage(msg);
-                } catch (_) {}
+                } catch (_) { }
             });
 
             this.ws.on('close', () => {
@@ -227,10 +230,11 @@ class AllTickService {
         if (this.ws) {
             try {
                 this.ws.removeAllListeners();
+                this.ws.on('error', () => { }); // Prevents unhandled error event on close
                 if (this.ws.readyState !== 3) { // 3 = CLOSED
                     this.ws.close();
                 }
-            } catch (_) {}
+            } catch (_) { }
             this.ws = null;
         }
         this.isWsConnected = false;
@@ -247,9 +251,9 @@ class AllTickService {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                 this.ws.send(JSON.stringify({
                     cmd_id: 22000,
-                    seq_id: Date.now(),
-                    trace:  'hb-' + Date.now(),
-                    data:   {}
+                    seq_id: Math.floor(Date.now() / 1000) % 1000000,
+                    trace: 'hb-' + Date.now(),
+                    data: {}
                 }));
             }
         }, 10000);
@@ -263,42 +267,42 @@ class AllTickService {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  Subscription  (cmd_id: 22004, field: "code")
+    //  Subscription  (cmd_id: 22002, field: "code")
     // ─────────────────────────────────────────────────────────
 
     _subscribe() {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         const symbolList = [...this.forexSymbols, ...this.cryptoSymbols]
-            .map(sym => ({ code: sym })); // AllTick uses "code", not "symbol"
+            .map(sym => ({ code: sym, depth_level: 5 })); // AllTick uses depth_level for depth subscriptions
 
         const subMsg = {
-            cmd_id: 22004,           // correct subscribe cmd_id per AllTick docs
-            seq_id: Date.now(),
-            trace:  'sub-' + Date.now(),
-            data:   { symbol_list: symbolList }
+            cmd_id: 22002,           // 22002 for Order Book (Depth) subscription per AllTick docs
+            seq_id: Math.floor(Date.now() / 1000) % 1000000,
+            trace: 'sub-' + Date.now(),
+            data: { symbol_list: symbolList }
         };
 
         this.ws.send(JSON.stringify(subMsg));
-        console.log(`[ALLTICKS] Subscribed to ${symbolList.length} symbols via WS`);
+        console.log(`[ALLTICKS] Subscribed to ${symbolList.length} symbols via WS (Depth Mode)`);
     }
 
     // ─────────────────────────────────────────────────────────
     //  Message Handling
-    //  Server push ticks use cmd_id 22998 (not 22004)
+    //  Server push ticks use cmd_id 22998 (trade tick) or 22999 (depth tick)
     // ─────────────────────────────────────────────────────────
 
     _handleWsMessage(msg) {
         if (!msg) return;
 
-        if (msg.cmd_id === 22998) {
+        if (msg.cmd_id === 22998 || msg.cmd_id === 22999) {
             // Server tick push — data is a single tick object
             if (msg.data) {
                 this._processTick(msg.data);
             }
         }
         // cmd_id 22001 = heartbeat pong — ignore silently
-        // cmd_id 22005 = subscription ack — ignore silently
+        // cmd_id 22003 / 22005 = subscription ack — ignore silently
     }
 
     // ─────────────────────────────────────────────────────────
@@ -309,42 +313,70 @@ class AllTickService {
     _processTick(tick) {
         if (!tick || !tick.code) return;
 
-        const symbol  = tick.code; // AllTick uses "code" not "symbol"
-        const isForex  = this.forexSymbols.includes(symbol);
+        const symbol = tick.code; // AllTick uses "code" not "symbol"
+        const isForex = this.forexSymbols.includes(symbol);
         const isCrypto = this.cryptoSymbols.includes(symbol);
         if (!isForex && !isCrypto) return;
 
-        // Extract bid from bids array (best bid = first element)
+        const cached = this.cache[symbol];
+
+        // Extract bid/ask from tick or fallback to cache / calculated spread
         let bid = 0;
         if (Array.isArray(tick.bids) && tick.bids.length > 0) {
             bid = parseFloat(tick.bids[0].price || 0);
         }
 
-        // Extract ask from asks array (best ask = first element)
         let ask = 0;
         if (Array.isArray(tick.asks) && tick.asks.length > 0) {
             ask = parseFloat(tick.asks[0].price || 0);
         }
 
-        // Calculate LTP as average of bid/ask (or use mid-price)
-        let ltp = bid && ask ? (bid + ask) / 2 : (bid || ask || 0);
+        // Get trade price (LTP) from this tick (WebSocket/trade-tick) or cached trade-tick poll or computed fallback
+        const tickPrice = parseFloat(tick.price || 0);
+        const realLtp = this.ltpCache[symbol];
+        let ltp = tickPrice || realLtp || (bid && ask ? (bid + ask) / 2 : (bid || ask || 0));
         if (!ltp || isNaN(ltp)) return;
+
+        // If bid or ask are missing from this tick (common in WebSocket trade push), recover them
+        if (bid > 0 && ask > 0) {
+            // Got valid order book spread directly from tick
+        } else if (cached && cached.bid > 0 && cached.ask > 0 && cached.ltp > 0) {
+            // Proportional adjustment based on the cached spread and new LTP
+            const ratio = ltp / cached.ltp;
+            bid = cached.bid * ratio;
+            ask = cached.ask * ratio;
+        } else {
+            // Fallback spread: 0.01% (0.0001) spread around LTP
+            const spreadPercent = 0.0001;
+            bid = ltp * (1 - spreadPercent / 2);
+            ask = ltp * (1 + spreadPercent / 2);
+        }
 
         if (!this.prevCloseCache[symbol]) {
             this.prevCloseCache[symbol] = ltp;
         }
-
-        // Calculate total volume from bids + asks
-        let totalVolume = 0;
-        if (Array.isArray(tick.bids)) {
-            tick.bids.forEach(b => {
-                totalVolume += parseFloat(b.volume || 0);
-            });
+        if (tick.pre_close_price && parseFloat(tick.pre_close_price) > 0) {
+            this.prevCloseCache[symbol] = parseFloat(tick.pre_close_price);
         }
-        if (Array.isArray(tick.asks)) {
-            tick.asks.forEach(a => {
-                totalVolume += parseFloat(a.volume || 0);
-            });
+
+        // Determine volume: tick volume, or sum of depth bids/asks, or cached volume
+        let volumeVal = 0;
+        if (tick.volume && !isNaN(parseFloat(tick.volume))) {
+            volumeVal = parseFloat(tick.volume);
+        } else {
+            if (Array.isArray(tick.bids)) {
+                tick.bids.forEach(b => {
+                    volumeVal += parseFloat(b.volume || 0);
+                });
+            }
+            if (Array.isArray(tick.asks)) {
+                tick.asks.forEach(a => {
+                    volumeVal += parseFloat(a.volume || 0);
+                });
+            }
+        }
+        if (volumeVal === 0 && cached && cached.volume && cached.volume !== '-') {
+            volumeVal = cached.volume;
         }
 
         const dataToFormat = {
@@ -352,13 +384,9 @@ class AllTickService {
             ask,
             ltp,
             previousClose: this.prevCloseCache[symbol],
-            volume:        totalVolume > 0 ? totalVolume : '-',
-            change:        0
+            volume: volumeVal > 0 ? volumeVal : '-',
+            change: 0
         };
-
-        if (tick.pre_close_price && parseFloat(tick.pre_close_price) > 0) {
-            this.prevCloseCache[symbol] = parseFloat(tick.pre_close_price);
-        }
 
         let formatted;
         if (isForex) {
@@ -380,11 +408,11 @@ class AllTickService {
             const mds = require('./MarketDataService');
             if (!mds || !mds.prices) return;
 
-            const prefix              = item.type;
-            const instrument          = item.instrument;
-            const slashedSymbol       = `${prefix}:${instrument}`;
+            const prefix = item.type;
+            const instrument = item.instrument;
+            const slashedSymbol = `${prefix}:${instrument}`;
             const unslashedInstrument = instrument.replace('/', '');
-            const unslashedSymbol     = `${prefix}:${unslashedInstrument}`;
+            const unslashedSymbol = `${prefix}:${unslashedInstrument}`;
 
             const base = { ...item, category: prefix.toLowerCase() };
 
@@ -392,7 +420,7 @@ class AllTickService {
                 ...mds.prices[slashedSymbol],
                 ...base,
                 symbol: slashedSymbol,
-                name:   instrument
+                name: instrument
             };
             mds.dirtySymbols.add(slashedSymbol);
 
@@ -400,8 +428,8 @@ class AllTickService {
                 ...mds.prices[unslashedSymbol],
                 ...base,
                 instrument: unslashedInstrument,
-                symbol:     unslashedSymbol,
-                name:       unslashedInstrument
+                symbol: unslashedSymbol,
+                name: unslashedInstrument
             };
             mds.dirtySymbols.add(unslashedSymbol);
 
@@ -420,15 +448,21 @@ class AllTickService {
 
     _startPolling() {
         if (this.pollingInterval) return;
-        console.log('[ALLTICKS] Starting HTTP polling (depth-tick, 1s interval)...');
+        console.log('[ALLTICKS] Starting HTTP polling (depth-tick + trade-tick, 1s interval)...');
         this._poll();
+        this._pollTradeTick(); // Fetch real LTP on start
         this.pollingInterval = setInterval(() => this._poll(), 1000);
+        this.tradeTickInterval = setInterval(() => this._pollTradeTick(), 2000); // LTP every 2s
     }
 
     _stopPolling() {
         if (this.pollingInterval) {
             clearInterval(this.pollingInterval);
             this.pollingInterval = null;
+        }
+        if (this.tradeTickInterval) {
+            clearInterval(this.tradeTickInterval);
+            this.tradeTickInterval = null;
         }
     }
 
@@ -438,12 +472,12 @@ class AllTickService {
         const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
         const query = JSON.stringify({
             trace: 'poll-' + Date.now(),
-            data:  { symbol_list: allSymbols.map(sym => ({ code: sym })) }
+            data: { symbol_list: allSymbols.map(sym => ({ code: sym })) }
         });
 
         try {
             const response = await axios.get(HTTP_DEPTH_URL, {
-                params:  { token: this.token, query },
+                params: { token: this.token, query },
                 timeout: 5000
             });
 
@@ -464,6 +498,47 @@ class AllTickService {
         } catch (err) {
             if (err.code !== 'ECONNABORTED') {
                 console.error('[ALLTICKS] HTTP Poll Error:', err.message);
+            }
+        }
+    }
+    /**
+     * Poll /trade-tick endpoint to get real LTP ("price" field).
+     * This is a separate AllTick endpoint that returns the last transaction price.
+     * We cache it per symbol and inject it in _processTick.
+     */
+    async _pollTradeTick() {
+        if (!this.token || !this.isRunning) return;
+
+        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
+        const query = JSON.stringify({
+            trace: 'trade-' + Date.now(),
+            data: { symbol_list: allSymbols.map(sym => ({ code: sym })) }
+        });
+
+        try {
+            const response = await axios.get(HTTP_TRADE_URL, {
+                params: { token: this.token, query },
+                timeout: 5000
+            });
+
+            const respData = response.data;
+            if (!respData || respData.ret !== 200) return;
+
+            const tickList = respData.data?.tick_list;
+            if (!Array.isArray(tickList)) return;
+
+            // Cache the real LTP per symbol
+            tickList.forEach(tick => {
+                if (tick.code && tick.price) {
+                    const realLtp = parseFloat(tick.price);
+                    if (!isNaN(realLtp) && realLtp > 0) {
+                        this.ltpCache[tick.code] = realLtp;
+                    }
+                }
+            });
+        } catch (err) {
+            if (err.code !== 'ECONNABORTED') {
+                // Silently fail — depth-tick mid-price fallback will be used
             }
         }
     }
