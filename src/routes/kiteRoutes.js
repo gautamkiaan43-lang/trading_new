@@ -125,7 +125,7 @@ function getTokenSync(symbol) {
 const WATCHLIST_CACHE_BUST = 'watchlist_v7_custom_mcx_continuous';
 
 /** NFO index options included in unified watchlist (instruments + quotes from Kite only). */
-const NFO_INDEX_OPTION_UNDERLYINGS = new Set(['NIFTY', 'BANKNIFTY']);
+const NFO_INDEX_OPTION_UNDERLYINGS = new Set(['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']);
 
 let NIFTY50 = [];
 let BANKNIFTY = [];
@@ -506,13 +506,13 @@ function resolveNfoIndexSpotLtp(ltpQuotes, cfg) {
         return global.LAST_KNOWN_LTPS[cfg.idxKey];
     }
     const defaults = {
-        NIFTY: 22000,
-        BANKNIFTY: 47000,
-        FINNIFTY: 21000,
-        MIDCPNIFTY: 10500
+        NIFTY: 24000,
+        BANKNIFTY: 52000,
+        FINNIFTY: 23000,
+        MIDCPNIFTY: 12000
     };
     const under = String(cfg.underlying || '').toUpperCase();
-    return defaults[under] || 22000;
+    return defaults[under] || 24000;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -567,7 +567,12 @@ async function buildKiteDashboardPayload(userId) {
     // NFO ATM Options (±5 strikes)
     for (const underlying of NFO_INDEX_OPTION_UNDERLYINGS) {
         const step = getOptionStrikeStepNfo(underlying);
-        const idxKey = underlying === 'NIFTY' ? 'NSE:NIFTY 50' : underlying === 'BANKNIFTY' ? 'NSE:NIFTY BANK' : 'NSE:NIFTY FIN SERVICE';
+        const idxKey = 
+            underlying === 'NIFTY' ? 'NSE:NIFTY 50' : 
+            underlying === 'BANKNIFTY' ? 'NSE:NIFTY BANK' : 
+            underlying === 'FINNIFTY' ? 'NSE:NIFTY FIN SERVICE' : 
+            underlying === 'MIDCPNIFTY' ? 'NSE:NIFTY MID SELECT' : 
+            `NSE:${underlying}`;
         const ltp = spotQuotes[idxKey]?.last_price || 0;
         if (!ltp || !step) continue;
 
@@ -832,6 +837,7 @@ let _precomputedQuerySig = '';
 
 function _getPrecomputed(instruments, query) {
     const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
     // ── NSE (default = curated list from user paste, validated against live NSE EQ/BE) ──
     const nseList = String(query.nse || '').trim();
@@ -1012,6 +1018,7 @@ async function _buildWatchlistData(query, userId) {
     }
 
     const today = new Date();
+    today.setHours(0, 0, 0, 0);
     const instruments = await getInstrumentsFromCache();
     const pc = _getPrecomputed(instruments, query);
 
@@ -1029,7 +1036,6 @@ async function _buildWatchlistData(query, userId) {
 
     // ── Step 2: NFO index options ──
     const nfoIndexOptRange = parseInt(query.nfoIndexOptRange, 10);
-    const nfoOptRangePts = Number.isFinite(nfoIndexOptRange) && nfoIndexOptRange > 0 ? nfoIndexOptRange : 5000;
     const nfoOptKeys = [];
     const nfoOptMeta = {};
     for (const cfg of pc.nfoConfig) {
@@ -1044,8 +1050,12 @@ async function _buildWatchlistData(query, userId) {
             optList.filter(i => new Date(i.expiry || 0) >= today).map(i => i.expiry)
         )].sort((a, b) => new Date(a) - new Date(b)).slice(0, 2);
         if (nfoOptExpiries.length === 0) continue;
-        const lowerBound = Math.floor((ltp - nfoOptRangePts) / step) * step;
-        const upperBound = Math.ceil((ltp + nfoOptRangePts) / step) * step;
+        
+        // ATM ±10 strikes range to match Contract Management
+        const atm = Math.round(ltp / step) * step;
+        const maxRange = Number.isFinite(nfoIndexOptRange) && nfoIndexOptRange > 0 ? nfoIndexOptRange : (step * 10);
+        const lowerBound = atm - maxRange;
+        const upperBound = atm + maxRange;
         const strikeSet = new Set();
         for (let s = lowerBound; s <= upperBound; s += step) strikeSet.add(s);
         for (const expiry of nfoOptExpiries) {
@@ -1141,9 +1151,11 @@ async function _buildWatchlistData(query, userId) {
         )].sort((a, b) => new Date(a) - new Date(b)).slice(0, 2);
         if (mcxOptExpiries.length === 0) continue;
 
-        // Build ATM strike range (same for all expiries of this base)
-        const lowerBound = Math.floor((ltp - mcxOptRangePts) / step) * step;
-        const upperBound = Math.ceil((ltp + mcxOptRangePts) / step) * step;
+        // Build ATM strike range (same for all expiries of this base) - ATM ±10 strikes
+        const atm = Math.round(ltp / step) * step;
+        const maxRange = Number.isFinite(pc.mcxOptRange) && pc.mcxOptRange > 0 ? pc.mcxOptRange : (step * 10);
+        const lowerBound = atm - maxRange;
+        const upperBound = atm + maxRange;
         const strikeSet = new Set();
         for (let s = lowerBound; s <= upperBound; s += step) strikeSet.add(s);
 
@@ -1596,13 +1608,13 @@ function resolveNfoIndexSpotLtp(ltpQuotes, cfg) {
         return global.LAST_KNOWN_LTPS[cfg.idxKey];
     }
     const defaults = {
-        NIFTY: 22000,
-        BANKNIFTY: 47000,
-        FINNIFTY: 21000,
-        MIDCPNIFTY: 10500
+        NIFTY: 24000,
+        BANKNIFTY: 52000,
+        FINNIFTY: 23000,
+        MIDCPNIFTY: 12000
     };
     const under = String(cfg.underlying || '').toUpperCase();
-    return defaults[under] || 22000;
+    return defaults[under] || 24000;
 }
 
 // Helper: format a quote into clean object

@@ -4,6 +4,7 @@ const kiteService = require('../utils/kiteService');
 const db = require('../config/db');
 
 const EXCLUDED_FILE = path.join(__dirname, '../data/excluded_contracts.json');
+const MANUALLY_ENABLED_FILE = path.join(__dirname, '../data/manually_enabled_contracts.json');
 const CONTRACTS_CACHE_FILE = path.join(__dirname, '../data/contracts_cache.json');
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -15,6 +16,21 @@ if (!fs.existsSync(dataDir)) {
 
 // Initialize or load excluded contracts
 let excludedContracts = [];
+let manuallyEnabledContracts = [];
+
+function loadManuallyEnabledContracts() {
+    try {
+        if (fs.existsSync(MANUALLY_ENABLED_FILE)) {
+            const data = fs.readFileSync(MANUALLY_ENABLED_FILE, 'utf8');
+            manuallyEnabledContracts = JSON.parse(data) || [];
+        } else {
+            manuallyEnabledContracts = [];
+        }
+    } catch (err) {
+        console.error('Error loading manually enabled contracts:', err.message);
+        manuallyEnabledContracts = [];
+    }
+}
 
 async function initializeDefaultExclusions() {
     try {
@@ -125,6 +141,7 @@ async function getAllContractsFromKite() {
 }
 
 loadExcludedContracts();
+loadManuallyEnabledContracts();
 
 // ─── Live NFO bases from DB (mirrors kiteRoutes ALL_NSE_STOCKS + NFO_INDICES) ───
 let _liveNfoBases = null; // Set<UPPERCASE symbol>
@@ -214,7 +231,8 @@ exports.saveContractSelection = async (req, res) => {
         // Use same pool as Contract Management display (FUT + CE + PE), so excluded
         // list only ever contains symbols the admin actually saw and unchecked.
         const instruments = await kiteService.getInstruments();
-        const allDisplayed = getMarketWatchContracts(instruments);
+        const { ltpQuotes, mcxNearestFutKey } = await fetchLtpQuotesForBases(instruments);
+        const allDisplayed = getMarketWatchContracts(instruments, ltpQuotes, mcxNearestFutKey);
         const allSymbols = allDisplayed.map(c => c.symbol);
 
         // Excluded = displayed but not selected
@@ -222,6 +240,11 @@ exports.saveContractSelection = async (req, res) => {
         excludedContracts = excluded;
         global.EXCLUDED_CONTRACTS = excluded;
         fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(excluded, null, 2));
+
+        // Save to manually enabled contracts file
+        manuallyEnabledContracts = contracts;
+        fs.writeFileSync(MANUALLY_ENABLED_FILE, JSON.stringify(contracts, null, 2));
+
         _bustWatchlistCache();
 
         // Broadcast to all connected users to refresh their snapshot (and exclusions)
@@ -316,7 +339,8 @@ exports.getRolloverSuggestions = async (req, res) => {
             return res.json({ status: 'success', enabled: rolloverService.isEnabled(), suggestions: [] });
         }
         const instruments = await kiteService.getInstruments().catch(() => []);
-        const allContracts = getMarketWatchContracts(instruments);
+        const { ltpQuotes, mcxNearestFutKey } = await fetchLtpQuotesForBases(instruments);
+        const allContracts = getMarketWatchContracts(instruments, ltpQuotes, mcxNearestFutKey);
         const result = rolloverService.getSuggestions(allContracts, excludedContracts);
         res.json({ status: 'success', ...result });
     } catch (err) {
@@ -370,6 +394,13 @@ exports.enableNextContract = async (req, res) => {
         const EXCLUDED_FILE = path.join(__dirname, '../data/excluded_contracts.json');
         fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(newExcluded, null, 2));
 
+        // Also add to manually enabled so it is not auto-excluded later
+        if (!manuallyEnabledContracts.includes(next_contract)) {
+            manuallyEnabledContracts.push(next_contract);
+            const MANUALLY_ENABLED_FILE = path.join(__dirname, '../data/manually_enabled_contracts.json');
+            fs.writeFileSync(MANUALLY_ENABLED_FILE, JSON.stringify(manuallyEnabledContracts, null, 2));
+        }
+
         _bustWatchlistCache();
 
         // Broadcast socket refresh (same as save-selection)
@@ -417,6 +448,14 @@ exports.completeRollover = async (req, res) => {
         const EXCLUDED_FILE = path.join(__dirname, '../data/excluded_contracts.json');
         fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(newExcluded, null, 2));
 
+        // Update manually enabled contracts list
+        manuallyEnabledContracts = manuallyEnabledContracts.filter(sym => sym !== current_contract);
+        if (!manuallyEnabledContracts.includes(next_contract)) {
+            manuallyEnabledContracts.push(next_contract);
+        }
+        const MANUALLY_ENABLED_FILE = path.join(__dirname, '../data/manually_enabled_contracts.json');
+        fs.writeFileSync(MANUALLY_ENABLED_FILE, JSON.stringify(manuallyEnabledContracts, null, 2));
+
         _bustWatchlistCache();
 
         // Broadcast socket refresh
@@ -461,6 +500,11 @@ exports.disableCurrentContract = async (req, res) => {
         const path = require('path');
         const EXCLUDED_FILE = path.join(__dirname, '../data/excluded_contracts.json');
         fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(newExcluded, null, 2));
+
+        // Update manually enabled contracts list
+        manuallyEnabledContracts = manuallyEnabledContracts.filter(sym => sym !== current_contract);
+        const MANUALLY_ENABLED_FILE = path.join(__dirname, '../data/manually_enabled_contracts.json');
+        fs.writeFileSync(MANUALLY_ENABLED_FILE, JSON.stringify(manuallyEnabledContracts, null, 2));
 
         _bustWatchlistCache();
 
@@ -513,30 +557,7 @@ const NFO_WATCH_BASES = [
     'BPCL', 'HCLTECH', 'LT', 'ITC', 'KOTAKBANK', 'ULTRACEMCO'
 ];
 
-function getMarketWatchContracts(instruments) {
-    const now = new Date();
-
-    // Major option parameters
-    const OPTION_STEPS = {
-        NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 50,
-        CRUDEOIL: 100, NATURALGAS: 5, GOLD: 100, SILVER: 250,
-        GOLDM: 10, SILVERM: 100, CRUDEOILM: 10, NATURALGASMINI: 1
-    };
-
-    // Realistic fallback prices (used only when live price unavailable)
-    const OPTION_DEFAULTS = {
-        NIFTY: 24000, BANKNIFTY: 52000, FINNIFTY: 23000, MIDCPNIFTY: 12000,
-        CRUDEOIL: 6500, NATURALGAS: 300, GOLD: 93000, SILVER: 95000,
-        GOLDM: 93000, SILVERM: 95000, CRUDEOILM: 6500, NATURALGASMINI: 300
-    };
-
-    // Cache live prices if available from MarketDataService
-    let marketDataService = null;
-    try {
-        marketDataService = require('../services/MarketDataService');
-    } catch (_) {}
-
-    // Pre-build MCX nearest FUT key map from instruments (avoids stale MCX:GOLDFUT key)
+async function fetchLtpQuotesForBases(instruments) {
     const mcxNearestFutKey = {};
     const _now = new Date();
     for (const instr of instruments) {
@@ -547,25 +568,83 @@ function getMarketWatchContracts(instruments) {
         if (!mcxNearestFutKey[baseName]) {
             mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
         } else {
-            // keep nearest expiry
             const existing = instruments.find(i => `MCX:${i.tradingsymbol}` === mcxNearestFutKey[baseName]);
             if (existing && new Date(instr.expiry) < new Date(existing.expiry)) {
                 mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
             }
         }
     }
+    const indexKeys = ['NSE:NIFTY 50', 'NSE:NIFTY BANK', 'NSE:NIFTY FIN SERVICE', 'NSE:NIFTY MID SELECT'];
+    const mcxKeys = Object.values(mcxNearestFutKey);
+    const allLtpKeys = [...indexKeys, ...mcxKeys];
+    let ltpQuotes = {};
+    try {
+        ltpQuotes = await kiteService.getQuote(allLtpKeys);
+    } catch (_) {}
+    return { ltpQuotes, mcxNearestFutKey };
+}
+
+function getMarketWatchContracts(instruments, ltpQuotes = {}, mcxNearestFutKeyInput = {}) {
+    const now = new Date();
+    // Normalize now to start of day so we don't skip today's expiring contracts
+    now.setHours(0, 0, 0, 0);
+
+    // Major option parameters
+    const OPTION_STEPS = {
+        NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 25,
+        CRUDEOIL: 50, NATURALGAS: 10, GOLD: 100, SILVER: 500,
+        GOLDM: 100, SILVERM: 500, CRUDEOILM: 50, NATURALGASMINI: 10
+    };
+
+    // Realistic fallback prices (used only when live price unavailable)
+    const OPTION_DEFAULTS = {
+        NIFTY: 24000, BANKNIFTY: 52000, FINNIFTY: 23000, MIDCPNIFTY: 12000,
+        CRUDEOIL: 6500, NATURALGAS: 200, GOLD: 93000, SILVER: 95000,
+        GOLDM: 93000, SILVERM: 95000, CRUDEOILM: 6500, NATURALGASMINI: 200
+    };
+
+    // Cache live prices if available from MarketDataService
+    let marketDataService = null;
+    try {
+        marketDataService = require('../services/MarketDataService');
+    } catch (_) {}
+
+    // Pre-build MCX nearest FUT key map from instruments (avoids stale MCX:GOLDFUT key)
+    const mcxNearestFutKey = { ...mcxNearestFutKeyInput };
+    if (Object.keys(mcxNearestFutKey).length === 0) {
+        const _now = new Date();
+        for (const instr of instruments) {
+            if (instr.exchange !== 'MCX') continue;
+            if (String(instr.instrument_type || '').toUpperCase() !== 'FUT') continue;
+            if (new Date(instr.expiry || 0) < _now) continue;
+            const baseName = String(instr.name || '').toUpperCase();
+            if (!mcxNearestFutKey[baseName]) {
+                mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
+            } else {
+                // keep nearest expiry
+                const existing = instruments.find(i => `MCX:${i.tradingsymbol}` === mcxNearestFutKey[baseName]);
+                if (existing && new Date(instr.expiry) < new Date(existing.expiry)) {
+                    mcxNearestFutKey[baseName] = `MCX:${instr.tradingsymbol}`;
+                }
+            }
+        }
+    }
 
     const getLtp = (underlying) => {
         const defaults = OPTION_DEFAULTS[underlying] || 500;
+        let key = '';
+        if (underlying === 'NIFTY') key = 'NSE:NIFTY 50';
+        else if (underlying === 'BANKNIFTY') key = 'NSE:NIFTY BANK';
+        else if (underlying === 'FINNIFTY') key = 'NSE:NIFTY FIN SERVICE';
+        else if (underlying === 'MIDCPNIFTY') key = 'NSE:NIFTY MID SELECT';
+        else key = mcxNearestFutKey[underlying] || `MCX:${underlying}FUT`;
+
+        if (ltpQuotes && ltpQuotes[key] && ltpQuotes[key].last_price > 0) {
+            return ltpQuotes[key].last_price;
+        }
+
         if (marketDataService) {
             try {
-                let key = '';
-                if (underlying === 'NIFTY') key = 'NSE:NIFTY 50';
-                else if (underlying === 'BANKNIFTY') key = 'NSE:NIFTY BANK';
-                else if (underlying === 'FINNIFTY') key = 'NSE:NIFTY FIN SERVICE';
-                else if (underlying === 'MIDCPNIFTY') key = 'NSE:NIFTY MID SELECT';
-                else key = mcxNearestFutKey[underlying] || `MCX:${underlying}FUT`;
-
                 const priceObj = marketDataService.getPrice(key) || marketDataService.getPrice(underlying);
                 if (priceObj && priceObj.ltp > 0) return priceObj.ltp;
             } catch (_) {}
@@ -587,6 +666,10 @@ function getMarketWatchContracts(instruments) {
         const type = (instr.instrument_type || '').toUpperCase();
         const baseName = (instr.name || '').toUpperCase();
         if (!instr.expiry) return;
+
+        // Skip expired contracts based on normalized start of day
+        const expiryDate = new Date(instr.expiry);
+        if (isNaN(expiryDate.getTime()) || expiryDate < now) return;
 
         const key = `${ex}:${baseName}:${type}`;
         if (!uniqueExpiriesMap[key]) {
@@ -698,7 +781,8 @@ exports.getMarketWatchExpiries = async (req, res) => {
         }
 
         const instruments = await kiteService.getInstruments();
-        const contracts = getMarketWatchContracts(instruments);
+        const { ltpQuotes, mcxNearestFutKey } = await fetchLtpQuotesForBases(instruments);
+        const contracts = getMarketWatchContracts(instruments, ltpQuotes, mcxNearestFutKey);
 
         // Auto-exclude MCX FUT contracts beyond position 3 per base (4th, 5th, 6th expiry).
         // Near-month (1st-3rd) stay enabled by default. Admin can override anytime.
@@ -713,7 +797,7 @@ exports.getMarketWatchExpiries = async (req, res) => {
         for (const baseContracts of Object.values(mcxFutPerBase)) {
             baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
             baseContracts.forEach((c, idx) => {
-                if (idx >= 3 && !excludedContracts.includes(c.symbol)) {
+                if (idx >= 3 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
                     excludedContracts.push(c.symbol);
                     changed = true;
                 }
@@ -732,7 +816,7 @@ exports.getMarketWatchExpiries = async (req, res) => {
         for (const baseContracts of Object.values(nfoFutPerBase)) {
             baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
             baseContracts.forEach((c, idx) => {
-                if (idx >= 1 && !excludedContracts.includes(c.symbol)) {
+                if (idx >= 1 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
                     excludedContracts.push(c.symbol);
                     changed = true;
                 }
@@ -754,7 +838,7 @@ exports.getMarketWatchExpiries = async (req, res) => {
             sortedExpiries.forEach((expiry, idx) => {
                 if (idx >= 1) {
                     expiryMap[expiry].forEach(c => {
-                        if (!excludedContracts.includes(c.symbol)) {
+                        if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
                             excludedContracts.push(c.symbol);
                             changed = true;
                         }
@@ -777,7 +861,7 @@ exports.getMarketWatchExpiries = async (req, res) => {
             sortedExpiries.forEach((expiry, idx) => {
                 if (idx >= 1) {
                     expiryMap[expiry].forEach(c => {
-                        if (!excludedContracts.includes(c.symbol)) {
+                        if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
                             excludedContracts.push(c.symbol);
                             changed = true;
                         }
