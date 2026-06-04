@@ -6,20 +6,12 @@ require('dotenv').config();
 const BASE_URL = 'https://api.kite.trade';
 const API_KEY = process.env.KITE_API_KEY;
 const API_SECRET = process.env.KITE_API_SECRET;
-const SESSION_FILE = path.join(__dirname, '../data/kite_session.json');
-
 class KiteService {
     constructor() {
         this.accessToken = null;
         this.sessionData = null;
 
-        // Ensure data directory exists
-        const dataDir = path.join(__dirname, '../data');
-        if (!fs.existsSync(dataDir)) {
-            fs.mkdirSync(dataDir, { recursive: true });
-        }
-
-        // Load existing session if available
+        // Load existing session if available from DB
         this.loadSession();
 
         // Token is now managed via Zerodha login or manual paste — no .env fallback needed
@@ -27,42 +19,60 @@ class KiteService {
 
     // ─── SESSION MANAGEMENT ───────────────────────────────
 
-    loadSession() {
+    async loadSessionFromDb() {
         try {
-            if (fs.existsSync(SESSION_FILE)) {
-                const content = fs.readFileSync(SESSION_FILE, 'utf8');
-                if (content && content !== '{}') {
-                    const data = JSON.parse(content);
-                    if (data.access_token) {
-                        // Check if session is from today (Kite tokens expire at ~6 AM next day)
-                        const savedDate = new Date(data.saved_at || 0).toDateString();
-                        const today = new Date().toDateString();
+            const db = require('../config/db');
+            const [rows] = await db.execute(
+                'SELECT * FROM user_kite_sessions ORDER BY saved_at DESC LIMIT 1'
+            );
+            if (rows && rows.length > 0) {
+                const data = rows[0];
+                if (data.access_token) {
+                    // Check if session is from today (Kite tokens expire at ~6 AM next day)
+                    const savedDate = new Date(data.saved_at || 0).toDateString();
+                    const today = new Date().toDateString();
 
-                        if (savedDate === today) {
-                            this.accessToken = data.access_token;
-                            this.sessionData = data;
-                            console.log('📂 Kite session loaded (today\'s token)');
-                        } else {
-                            console.log('⚠️  Kite session expired (old date). Need fresh login.');
-                            this.accessToken = null;
-                            this.sessionData = null;
-                        }
+                    if (savedDate === today) {
+                        this.accessToken = data.access_token;
+                        this.sessionData = {
+                            access_token: data.access_token,
+                            user_name: data.user_name,
+                            user_id: data.kite_user_id,
+                            email: data.email,
+                            saved_at: data.saved_at
+                        };
+                        console.log('📂 Kite session loaded from DB (today\'s token)');
+                        return true;
+                    } else {
+                        console.log('⚠️  Kite session expired in DB (old date). Need fresh login.');
+                        this.accessToken = null;
+                        this.sessionData = null;
                     }
                 }
+            } else {
+                console.log('ℹ️  No Kite session found in DB.');
             }
         } catch (err) {
-            console.error('Error loading Kite session:', err.message);
+            console.error('Error loading Kite session from DB:', err.message);
         }
+        return false;
+    }
+
+    loadSession() {
+        // Trigger async load from DB
+        this.loadSessionFromDb().catch(err => {
+            console.error('Error in loadSession trigger:', err.message);
+        });
     }
 
     saveSession(data) {
         try {
-            const sessionData = {
+            this.accessToken = data.access_token;
+            this.sessionData = {
                 ...data,
                 saved_at: new Date().toISOString(),
             };
-            fs.writeFileSync(SESSION_FILE, JSON.stringify(sessionData, null, 2));
-            console.log('💾 Kite session saved.');
+            console.log('💾 Kite session updated in memory.');
         } catch (err) {
             console.error('Error saving Kite session:', err.message);
         }
@@ -71,9 +81,7 @@ class KiteService {
     clearSession() {
         this.accessToken = null;
         this.sessionData = null;
-        try {
-            if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
-        } catch (e) { /* ignore */ }
+        console.log('🗑️  Kite session cleared from memory.');
     }
 
     // ─── SET ACCESS TOKEN DIRECTLY ─────────────────────────

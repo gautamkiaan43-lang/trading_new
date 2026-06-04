@@ -279,14 +279,9 @@ module.exports = {
         return cfg;
     },
 
-    /**
-     * Main entry point.
-     * Pass the parsed allContracts array and excludedContracts array
-     * (both already available in contractController).
-     */
-    getSuggestions(allContracts, excludedContracts) {
+    getSuggestions(allContracts, excludedContracts, forceEnabled = false) {
         const cfg = loadConfig();
-        if (!cfg.enabled) return { enabled: false, suggestions: [] };
+        if (!cfg.enabled && !forceEnabled) return { enabled: false, suggestions: [] };
         const suggestions = generateSuggestions(allContracts, excludedContracts || []);
         return { enabled: true, suggestions };
     },

@@ -129,11 +129,16 @@ setIo(io);
 // Auto-sync Kite instruments into database
 async function syncKiteInstrumentsOnStartup() {
     try {
+        const kiteService = require('./utils/kiteService');
+        // Ensure session is loaded from database first
+        await kiteService.loadSessionFromDb();
+
         const instrumentSyncService = require('./services/InstrumentSyncService');
         await instrumentSyncService.sync();
         instrumentSyncService.startSyncJob();
     } catch (err) {
         // Sync failed but system continues - real data available from Zerodha
+        console.error('[Sync Startup] Error during startup sync:', err.message);
     }
 }
 

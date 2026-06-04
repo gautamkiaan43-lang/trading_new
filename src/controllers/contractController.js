@@ -335,14 +335,18 @@ const rolloverService = require('../services/rolloverSuggestionService');
  */
 exports.getRolloverSuggestions = async (req, res) => {
     try {
-        if (!kiteService.isAuthenticated()) {
-            return res.json({ status: 'success', enabled: rolloverService.isEnabled(), suggestions: [] });
+        const [rules] = await db.execute('SELECT contract_mode FROM expiry_rules LIMIT 1');
+        const contractMode = (rules && rules[0] && rules[0].contract_mode) || 'MANUAL';
+        const isAuto = contractMode === 'AUTO';
+
+        if (!isAuto || !kiteService.isAuthenticated()) {
+            return res.json({ status: 'success', enabled: isAuto, suggestions: [] });
         }
         const instruments = await kiteService.getInstruments().catch(() => []);
         const { ltpQuotes, mcxNearestFutKey } = await fetchLtpQuotesForBases(instruments);
         const allContracts = getMarketWatchContracts(instruments, ltpQuotes, mcxNearestFutKey);
-        const result = rolloverService.getSuggestions(allContracts, excludedContracts);
-        res.json({ status: 'success', ...result });
+        const result = rolloverService.getSuggestions(allContracts, excludedContracts, isAuto);
+        res.json({ status: 'success', enabled: isAuto, suggestions: result.suggestions || [] });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
@@ -354,14 +358,25 @@ exports.getRolloverSuggestions = async (req, res) => {
  * Enables or disables the Smart Rollover system.
  * Does NOT affect live quotes, sockets, search, order flow, or watchlists.
  */
-exports.setRolloverConfig = (req, res) => {
+exports.setRolloverConfig = async (req, res) => {
     try {
         const { enabled } = req.body;
         if (typeof enabled !== 'boolean') {
             return res.status(400).json({ status: 'error', error: '"enabled" must be a boolean' });
         }
+        const mode = enabled ? 'AUTO' : 'MANUAL';
+        
+        // Update globally in database
+        await db.execute('UPDATE expiry_rules SET contract_mode = ?', [mode]);
+
+        // Keep local service config in sync
         const cfg = rolloverService.setEnabled(enabled);
-        res.json({ status: 'success', config: cfg, message: enabled ? 'Smart Rollover enabled' : 'Smart Rollover disabled' });
+
+        res.json({ 
+            status: 'success', 
+            config: cfg, 
+            message: enabled ? 'Smart Rollover Mode (AUTO) enabled' : 'Manual Selection Mode (MANUAL) enabled' 
+        });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
@@ -784,96 +799,104 @@ exports.getMarketWatchExpiries = async (req, res) => {
         const { ltpQuotes, mcxNearestFutKey } = await fetchLtpQuotesForBases(instruments);
         const contracts = getMarketWatchContracts(instruments, ltpQuotes, mcxNearestFutKey);
 
-        // Auto-exclude MCX FUT contracts beyond position 3 per base (4th, 5th, 6th expiry).
-        // Near-month (1st-3rd) stay enabled by default. Admin can override anytime.
-        const mcxFutPerBase = {};
-        for (const c of contracts) {
-            if (c.segment === 'MCX' && c.instrument_type === 'FUT') {
-                if (!mcxFutPerBase[c.name]) mcxFutPerBase[c.name] = [];
-                mcxFutPerBase[c.name].push(c);
+        // Fetch current contract management mode (AUTO vs MANUAL)
+        const [rules] = await db.execute('SELECT contract_mode FROM expiry_rules LIMIT 1');
+        const contractMode = (rules && rules[0] && rules[0].contract_mode) || 'MANUAL';
+
+        // Auto-exclusions are ONLY processed when Smart Rollover Mode (AUTO) is active
+        if (contractMode === 'AUTO') {
+            // Auto-exclude MCX FUT contracts beyond position 3 per base (4th, 5th, 6th expiry).
+            // Near-month (1st-3rd) stay enabled by default. Admin can override anytime.
+            const mcxFutPerBase = {};
+            for (const c of contracts) {
+                if (c.segment === 'MCX' && c.instrument_type === 'FUT') {
+                    if (!mcxFutPerBase[c.name]) mcxFutPerBase[c.name] = [];
+                    mcxFutPerBase[c.name].push(c);
+                }
+            }
+            let changed = false;
+            for (const baseContracts of Object.values(mcxFutPerBase)) {
+                baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+                baseContracts.forEach((c, idx) => {
+                    if (idx >= 3 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
+                        excludedContracts.push(c.symbol);
+                        changed = true;
+                    }
+                });
+            }
+
+            // Auto-exclude NFO FUT beyond nearest 1 expiry per base (same as MCX logic).
+            // Live market uses only 1 expiry per stock/index; 2nd+ are disabled by default.
+            const nfoFutPerBase = {};
+            for (const c of contracts) {
+                if (c.segment === 'NFO' && c.instrument_type === 'FUT') {
+                    if (!nfoFutPerBase[c.name]) nfoFutPerBase[c.name] = [];
+                    nfoFutPerBase[c.name].push(c);
+                }
+            }
+            for (const baseContracts of Object.values(nfoFutPerBase)) {
+                baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+                baseContracts.forEach((c, idx) => {
+                    if (idx >= 1 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
+                        excludedContracts.push(c.symbol);
+                        changed = true;
+                    }
+                });
+            }
+
+            // Auto-exclude MCX CE/PE options beyond nearest 1 expiry per underlying.
+            // Live market shows only 1 expiry by default; 2nd+ disabled. Admin can enable any.
+            const mcxOptByUnderlying = {};
+            for (const c of contracts) {
+                if (c.segment === 'MCX' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
+                    if (!mcxOptByUnderlying[c.name]) mcxOptByUnderlying[c.name] = {};
+                    if (!mcxOptByUnderlying[c.name][c.expiry]) mcxOptByUnderlying[c.name][c.expiry] = [];
+                    mcxOptByUnderlying[c.name][c.expiry].push(c);
+                }
+            }
+            for (const expiryMap of Object.values(mcxOptByUnderlying)) {
+                const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
+                sortedExpiries.forEach((expiry, idx) => {
+                    if (idx >= 1) {
+                        expiryMap[expiry].forEach(c => {
+                            if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
+                                excludedContracts.push(c.symbol);
+                                changed = true;
+                            }
+                        });
+                    }
+                });
+            }
+
+            // Auto-exclude NFO CE/PE options beyond nearest 1 expiry per underlying.
+            const nfoOptByUnderlying = {};
+            for (const c of contracts) {
+                if (c.segment === 'NFO' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
+                    if (!nfoOptByUnderlying[c.name]) nfoOptByUnderlying[c.name] = {};
+                    if (!nfoOptByUnderlying[c.name][c.expiry]) nfoOptByUnderlying[c.name][c.expiry] = [];
+                    nfoOptByUnderlying[c.name][c.expiry].push(c);
+                }
+            }
+            for (const expiryMap of Object.values(nfoOptByUnderlying)) {
+                const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
+                sortedExpiries.forEach((expiry, idx) => {
+                    if (idx >= 1) {
+                        expiryMap[expiry].forEach(c => {
+                            if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
+                                excludedContracts.push(c.symbol);
+                                changed = true;
+                            }
+                        });
+                    }
+                });
+            }
+
+            if (changed) {
+                global.EXCLUDED_CONTRACTS = excludedContracts;
+                fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(excludedContracts, null, 2));
             }
         }
-        let changed = false;
-        for (const baseContracts of Object.values(mcxFutPerBase)) {
-            baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
-            baseContracts.forEach((c, idx) => {
-                if (idx >= 3 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
-                    excludedContracts.push(c.symbol);
-                    changed = true;
-                }
-            });
-        }
 
-        // Auto-exclude NFO FUT beyond nearest 1 expiry per base (same as MCX logic).
-        // Live market uses only 1 expiry per stock/index; 2nd+ are disabled by default.
-        const nfoFutPerBase = {};
-        for (const c of contracts) {
-            if (c.segment === 'NFO' && c.instrument_type === 'FUT') {
-                if (!nfoFutPerBase[c.name]) nfoFutPerBase[c.name] = [];
-                nfoFutPerBase[c.name].push(c);
-            }
-        }
-        for (const baseContracts of Object.values(nfoFutPerBase)) {
-            baseContracts.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
-            baseContracts.forEach((c, idx) => {
-                if (idx >= 1 && !excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
-                    excludedContracts.push(c.symbol);
-                    changed = true;
-                }
-            });
-        }
-
-        // Auto-exclude MCX CE/PE options beyond nearest 1 expiry per underlying.
-        // Live market shows only 1 expiry by default; 2nd+ disabled. Admin can enable any.
-        const mcxOptByUnderlying = {};
-        for (const c of contracts) {
-            if (c.segment === 'MCX' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
-                if (!mcxOptByUnderlying[c.name]) mcxOptByUnderlying[c.name] = {};
-                if (!mcxOptByUnderlying[c.name][c.expiry]) mcxOptByUnderlying[c.name][c.expiry] = [];
-                mcxOptByUnderlying[c.name][c.expiry].push(c);
-            }
-        }
-        for (const expiryMap of Object.values(mcxOptByUnderlying)) {
-            const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
-            sortedExpiries.forEach((expiry, idx) => {
-                if (idx >= 1) {
-                    expiryMap[expiry].forEach(c => {
-                        if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
-                            excludedContracts.push(c.symbol);
-                            changed = true;
-                        }
-                    });
-                }
-            });
-        }
-
-        // Auto-exclude NFO CE/PE options beyond nearest 1 expiry per underlying.
-        const nfoOptByUnderlying = {};
-        for (const c of contracts) {
-            if (c.segment === 'NFO' && (c.instrument_type === 'CE' || c.instrument_type === 'PE')) {
-                if (!nfoOptByUnderlying[c.name]) nfoOptByUnderlying[c.name] = {};
-                if (!nfoOptByUnderlying[c.name][c.expiry]) nfoOptByUnderlying[c.name][c.expiry] = [];
-                nfoOptByUnderlying[c.name][c.expiry].push(c);
-            }
-        }
-        for (const expiryMap of Object.values(nfoOptByUnderlying)) {
-            const sortedExpiries = Object.keys(expiryMap).sort((a, b) => new Date(a) - new Date(b));
-            sortedExpiries.forEach((expiry, idx) => {
-                if (idx >= 1) {
-                    expiryMap[expiry].forEach(c => {
-                        if (!excludedContracts.includes(c.symbol) && !manuallyEnabledContracts.includes(c.symbol)) {
-                            excludedContracts.push(c.symbol);
-                            changed = true;
-                        }
-                    });
-                }
-            });
-        }
-
-        if (changed) {
-            global.EXCLUDED_CONTRACTS = excludedContracts;
-            fs.writeFileSync(EXCLUDED_FILE, JSON.stringify(excludedContracts, null, 2));
-        }
         // Re-apply isSelected with updated excluded list
         contracts.forEach(c => { c.isSelected = !excludedContracts.includes(c.symbol); });
 

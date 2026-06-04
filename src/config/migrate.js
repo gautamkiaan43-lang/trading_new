@@ -427,6 +427,9 @@ const runMigrations = async () => {
     // Ensure user_id column exists for existing tables
     await addColumn('expiry_rules', 'user_id', 'INT DEFAULT NULL AFTER id');
 
+    // Add contract_mode column
+    await addColumn('expiry_rules', 'contract_mode', "VARCHAR(20) DEFAULT 'MANUAL'");
+
     // Add unique constraint if not already there
     try { await db.execute('ALTER TABLE expiry_rules ADD UNIQUE KEY uq_user_expiry (user_id)'); } catch (_) { }
 

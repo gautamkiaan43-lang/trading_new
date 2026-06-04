@@ -14,6 +14,12 @@ class InstrumentSyncService {
         // Run every 6 hours
         cron.schedule('0 */6 * * *', async () => {
             console.log('⏰ [InstrumentSyncService] Starting scheduled 6-hour sync...');
+            try {
+                const kiteService = require('../utils/kiteService');
+                await kiteService.loadSessionFromDb();
+            } catch (sessionErr) {
+                console.error('⚠️ [InstrumentSyncService] Failed to load session from DB before sync:', sessionErr.message);
+            }
             await this.sync();
         });
         console.log('✅ [InstrumentSyncService] 6-hour sync job scheduled');
