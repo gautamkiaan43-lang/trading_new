@@ -62,6 +62,7 @@ const getHierarchyAccounts = async (req, res) => {
 
             if (!clients.length) {
                 result.push({
+                    brokerId: broker.id,
                     broker: broker.username,
                     fullName: broker.full_name || '',
                     clientPL: '0.00',
@@ -110,6 +111,7 @@ const getHierarchyAccounts = async (req, res) => {
             const receivablePayable = netShare >= 0 ? 'Payable' : 'Receivable';
 
             result.push({
+                brokerId: broker.id,
                 broker: broker.username,
                 fullName: broker.full_name || '',
                 clientPL: clientPL.toFixed(2),

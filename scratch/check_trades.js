@@ -1,26 +1,12 @@
-const mysql = require('mysql2/promise');
-
+const db = require('../src/config/db');
 async function run() {
-    const connection = await mysql.createConnection({
-        host: 'localhost',
-        port: 3308,
-        user: 'root',
-        password: '',
-        database: 'traderdb'
-    });
-
     try {
-        console.log('Querying database for pending trades...');
-        const [rows] = await connection.execute(
-            "SELECT id, user_id, symbol, type, entry_price, market_type, status, is_pending FROM trades WHERE status = 'OPEN' AND is_pending = 1"
-        );
-        console.log('--- OPEN PENDING TRADES ---');
-        console.log(JSON.stringify(rows, null, 2));
+        const [trades] = await db.query("SELECT id, user_id, symbol, market_type, qty, entry_price, status FROM trades WHERE status = 'OPEN'");
+        console.log("ACTIVE TRADES IN DB:", trades);
     } catch (e) {
-        console.error('Error:', e);
+        console.error(e);
     } finally {
-        await connection.end();
+        process.exit(0);
     }
 }
-
 run();

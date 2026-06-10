@@ -2,6 +2,10 @@ const db = require('../config/db');
 const marketDataService = require('./MarketDataService');
 const { getIo } = require('../config/socket');
 const { logAction } = require('../controllers/systemController');
+const { getLotSize } = require('../utils/symbolHelper');
+const { buildTradeLog } = require('../utils/logFormatter');
+
+const tradeService = require('./TradeService');
 
 /**
  * Pending Order Matching Service
@@ -12,7 +16,10 @@ const monitorPendingOrders = async () => {
     try {
         // Fetch all trades that are OPEN and PENDING (is_pending = 1)
         const [pendingTrades] = await db.execute(
-            "SELECT id, user_id, symbol, type, entry_price, market_type FROM trades WHERE status = 'OPEN' AND is_pending = 1"
+            `SELECT t.id, t.user_id, t.symbol, t.type, t.entry_price, t.qty, t.market_type, u.username, u.balance 
+             FROM trades t 
+             JOIN users u ON t.user_id = u.id 
+             WHERE t.status = 'OPEN' AND t.is_pending = 1`
         );
 
         if (pendingTrades.length === 0) return;
@@ -60,32 +67,40 @@ const monitorPendingOrders = async () => {
                 if (shouldExecute) {
                     console.log(`[PendingOrder] 🚀 EXECUTING Trade #${trade.id} (${trade.symbol}) at ${currentPrice} (Limit: ${limitPrice})`);
 
-                    // 1. Update trade to ACTIVE (is_pending = 0) and refresh entry time
-                    await db.execute(
-                        'UPDATE trades SET is_pending = 0, executed_from_pending = 1, entry_time = NOW() WHERE id = ?',
-                        [trade.id]
-                    );
+                    // Call TradeService to handle netting and execution
+                    const res = await tradeService.executePendingOrderNetting(trade.id, currentPrice);
 
-                    // 2. Log the execution
-                    await logAction(trade.user_id, 'EXECUTE_PENDING', 'trades',
-                        `Pending order #${trade.id} executed at market price ${currentPrice} (Limit: ${limitPrice})`);
+                    // Log the execution
+                    const lotSize = getLotSize(trade.symbol, trade.market_type);
+                    const lotsVal = trade.qty / lotSize;
+                    const matchedLog = buildTradeLog('LIMIT_MATCHED', {
+                        username: trade.username,
+                        userId: trade.user_id,
+                        side: trade.type,
+                        lots: lotsVal,
+                        symbol: trade.symbol,
+                        limitPrice: limitPrice
+                    });
+                    await logAction(trade.user_id, 'EXECUTE_PENDING', 'trades', matchedLog);
 
-                    // 3. Notify user via Socket for real-time UI update
+                    // Notify user via Socket
                     const io = getIo();
                     if (io) {
-                        // Notify user about execution
-                        io.to(`user:${trade.user_id}`).emit('notification', {
-                            message: `Pending ${trade.type} order for ${cleanSymbol} executed successfully at ₹${currentPrice}`,
-                            type: 'ORDER_EXECUTED',
-                            tradeId: trade.id
-                        });
+                        const remainingQty = res.nettingRes?.remainingQty;
+                        if (remainingQty === undefined || remainingQty > 0) {
+                            io.to(`user:${trade.user_id}`).emit('notification', {
+                                message: `Pending ${trade.type} order for ${cleanSymbol} executed successfully at ₹${currentPrice}${remainingQty !== undefined ? ` (remaining open: ${remainingQty})` : ''}`,
+                                type: 'ORDER_EXECUTED',
+                                tradeId: trade.id
+                            });
 
-                        // Force a refresh of trades in the app
-                        io.to(`user:${trade.user_id}`).emit('trade_update', {
-                            id: trade.id,
-                            is_pending: 0,
-                            status: 'OPEN'
-                        });
+                            io.to(`user:${trade.user_id}`).emit('trade_update', {
+                                id: trade.id,
+                                is_pending: 0,
+                                status: 'OPEN',
+                                qty: remainingQty
+                            });
+                        }
                     }
                 }
             } catch (tradeErr) {

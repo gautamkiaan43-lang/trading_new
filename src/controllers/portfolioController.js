@@ -81,7 +81,10 @@ const getBalance = async (req, res) => {
         let totalMarginUsed = 0;
 
         openTrades.forEach(trade => {
-            const mType = (trade.market_type || 'MCX').toUpperCase();
+            let mType = (trade.market_type || 'MCX').toUpperCase();
+            if (mType === 'COMMODITY') {
+                mType = 'COMEX'; // Map COMMODITY to COMEX segment for portfolio breakdown
+            }
             const calc = MarginUtils.calculateTotalRequiredHoldingMargin([trade], clientConfig);
             totalMarginUsed += calc;
             if (marginBySegment[mType] !== undefined) {

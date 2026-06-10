@@ -1,4 +1,14 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
+
+// Prevent server crash on unhandled network or rejection errors (e.g. during internet drop)
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ [Global] Unhandled Rejection:', reason?.message || reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ [Global] Uncaught Exception:', err.message);
+});
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');

@@ -37,16 +37,34 @@ router.get('/forex', authMiddleware, async (req, res) => {
     }
 });
 
+// ── GET /api/market-data/commodity ──
+router.get('/commodity', authMiddleware, async (req, res) => {
+    try {
+        const cached = marketDataService.getCommodityPrices();
+        res.json({ 
+            status: 'success', 
+            type: 'commodity', 
+            count: cached.length, 
+            timestamp: new Date().toISOString(), 
+            data: cached 
+        });
+    } catch (err) {
+        res.status(500).json({ status: 'error', message: err.message });
+    }
+});
+
 // ── GET /api/market-data/all — Both in one call ──
 router.get('/all', authMiddleware, async (req, res) => {
     try {
         const crypto = marketDataService.getCryptoPrices();
         const forex = marketDataService.getForexPrices();
+        const commodity = marketDataService.getCommodityPrices();
         res.json({ 
             status: 'success', 
             timestamp: new Date().toISOString(), 
             crypto, 
-            forex 
+            forex,
+            commodity
         });
     } catch (err) {
         res.status(500).json({ status: 'error', message: err.message });

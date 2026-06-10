@@ -70,6 +70,7 @@ class SocketManager {
 
                     const crypto = marketDataService.getCryptoPrices();
                     const forex = marketDataService.getForexPrices();
+                    const commodity = marketDataService.getCommodityPrices();
 
                     const kite_connected = Boolean(kiteResult.ok && !kiteResult.kite_disconnected);
 
@@ -88,6 +89,7 @@ class SocketManager {
                         watchlist: Array.isArray(kiteResult.data) ? kiteResult.data : [],
                         crypto,
                         forex,
+                        commodity,
                         binance_error: marketDataService.getBinanceError(),
                         dashboard,
                         excludedContracts: global.EXCLUDED_CONTRACTS || [],
@@ -101,7 +103,8 @@ class SocketManager {
                         kite_disconnected: true,
                         watchlist: [],
                         crypto: [],
-                        forex: []
+                        forex: [],
+                        commodity: []
                     });
                 }
             });

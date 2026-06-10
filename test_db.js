@@ -1,16 +1,23 @@
-require('dotenv').config();
-const mysql = require('mysql2/promise');
-async function run() {
-    const conn = await mysql.createConnection({
-        host: process.env.DB_HOST || 'localhost',
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || '',
-        port: process.env.DB_PORT || 3308,
-        database: process.env.DB_NAME || 'traderdb'
-    });
-    
-    const [rows] = await conn.query('SELECT tradingsymbol, instrument_token, expiry, ltp FROM script_testing');
-    console.table(rows);
-    await conn.end();
+const db = require('./src/config/db');
+
+async function testDb() {
+  try {
+    const [forexItems] = await db.execute('SELECT * FROM market_group_items WHERE group_id = 8');
+    console.log('FOREX ITEMS:');
+    console.log(forexItems.map(i => i.symbol));
+
+    const [cryptoItems] = await db.execute('SELECT * FROM market_group_items WHERE group_id = 7');
+    console.log('CRYPTO ITEMS:');
+    console.log(cryptoItems.map(i => i.symbol));
+
+    const [commodityItems] = await db.execute('SELECT * FROM market_group_items WHERE group_id = 15019');
+    console.log('COMMODITY ITEMS:');
+    console.log(commodityItems.map(i => i.symbol));
+  } catch (err) {
+    console.error('Error:', err.message);
+  } finally {
+    process.exit(0);
+  }
 }
-run().catch(console.error);
+
+testDb();

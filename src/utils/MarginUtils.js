@@ -50,10 +50,47 @@ const MarginUtils = {
             } else if (mType === 'OPTIONS') {
                 // Options typically use a divisor of 1 or a small value
                 tradeMargin = turnover / 1;
-            } else if (mType === 'COMEX' || mType === 'FOREX' || mType === 'CRYPTO') {
-                const segConfig = clientConfig[`${mType.toLowerCase()}Config`] || {};
-                const holdingExposure = parseFloat(segConfig.holdingMargin || segConfig.intradayMargin || 100);
-                tradeMargin = turnover / (holdingExposure || 1);
+            } else if (mType === 'COMEX' || mType === 'FOREX' || mType === 'CRYPTO' || mType === 'COMMODITY') {
+                let segConfig = {};
+                if (mType === 'COMMODITY' || mType === 'COMEX') {
+                    const commodityConfig = clientConfig.commodityConfig || {};
+                    const comexConfig = clientConfig.comexConfig || {};
+                    const forexConfig = clientConfig.forexConfig || {};
+
+                    const isPopulated = (cfg) => {
+                        if (!cfg) return false;
+                        if (cfg.lotMargins && Object.keys(cfg.lotMargins).length > 0) return true;
+                        if (cfg.exposureType && cfg.exposureType !== 'per_crore') return true;
+                        if (parseFloat(cfg.intradayMargin || 0) > 0 || parseFloat(cfg.holdingMargin || 0) > 0) return true;
+                        return false;
+                    };
+
+                    if (isPopulated(commodityConfig)) {
+                        segConfig = commodityConfig;
+                    } else if (isPopulated(comexConfig)) {
+                        segConfig = comexConfig;
+                    } else if (isPopulated(forexConfig)) {
+                        segConfig = forexConfig;
+                    } else {
+                        segConfig = commodityConfig || comexConfig || forexConfig || {};
+                    }
+                } else {
+                    segConfig = clientConfig[`${mType.toLowerCase()}Config`] || {};
+                }
+
+                const exposureType = segConfig.exposureType || 'per_crore';
+                const rawScrip = (trade.symbol || '').split(':').pop().toUpperCase();
+
+                if (exposureType === 'per_lot') {
+                    // Try exact scrip name, then slash-stripped variant (XAUUSD vs XAU/USD)
+                    const noSlash = rawScrip.replace('/', '');
+                    const symbolMargins = (segConfig.lotMargins && (segConfig.lotMargins[rawScrip] || segConfig.lotMargins[noSlash])) || { HOLDING: '0' };
+                    const holdingMarginVal = parseFloat(symbolMargins.HOLDING || 0);
+                    tradeMargin = holdingMarginVal * qtyNum;
+                } else {
+                    const holdingExposure = parseFloat(segConfig.holdingMargin || segConfig.intradayMargin || 100);
+                    tradeMargin = turnover / (holdingExposure || 1);
+                }
             }
 
             // Fallback for any missed segments or 0 results (but keep 0 if intentional)

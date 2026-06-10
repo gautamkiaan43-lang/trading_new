@@ -22,6 +22,7 @@ const WebSocket = require('ws');
 const axios = require('axios');
 const { formatForexData } = require('../utils/forexFormatter');
 const { formatCryptoData } = require('../utils/cryptoFormatter');
+const { formatCommodityData } = require('../utils/commodityFormatter');
 
 const WS_URL = 'wss://quote.alltick.io/quote-b-ws-api';
 const HTTP_DEPTH_URL = 'https://quote.alltick.io/quote-b-api/depth-tick';
@@ -50,6 +51,10 @@ class AllTickService {
             'ADAUSDT', 'AVAXUSDT', 'BNBUSDT', 'BTCUSDT', 'DOGEUSDT',
             'DOTUSDT', 'ETHUSDT', 'MATICUSDT', 'SOLUSDT', 'XRPUSDT'
         ];
+        // Default fallback commodity symbols (will be overridden by DB symbols)
+        this.commoditySymbols = [
+            'GOLD', 'Silver', 'USOIL', 'NGAS'
+        ];
 
         this.cache = {};
         this.prevCloseCache = {};
@@ -71,6 +76,9 @@ class AllTickService {
                 this.forexSymbols = forexRows.map(r => {
                     const sym = r.symbol || '';
                     // Special cases for commodity codes that don't follow standard format
+                    if (sym === 'XAU/USD') {
+                        return 'GOLD';   // XAU/USD → GOLD (AllTicks code)
+                    }
                     if (sym === 'XAG/USD') {
                         return 'Silver';  // XAG/USD → Silver (AllTicks code)
                     }
@@ -90,6 +98,23 @@ class AllTickService {
                     // Convert BTC/USD → BTCUSDT format for AllTick
                     const sym = (r.symbol || '').replace(/\/USD$/i, 'USDT').replace(/\//g, '');
                     return sym;
+                }).filter(Boolean);
+            }
+
+            // Load Commodity symbols from DB and convert to AllTick format (ONLY GOLD, SILVER, USOIL and NGAS)
+            const [commodityRows] = await db.execute(`
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
+                WHERE mg.name = 'COMMODITY'
+            `);
+            if (commodityRows.length > 0) {
+                this.commoditySymbols = commodityRows.map(r => {
+                    const sym = r.symbol || '';
+                    if (sym === 'XAU/USD') return 'GOLD';
+                    if (sym === 'XAG/USD') return 'Silver';
+                    if (sym === 'USOIL') return 'USOIL';
+                    if (sym === 'NGAS') return 'NGAS';
+                    return null;
                 }).filter(Boolean);
             }
         } catch (err) {
@@ -114,7 +139,7 @@ class AllTickService {
         // Load symbols from database first (replaces hardcoded list)
         await this._loadSymbolsFromDb();
 
-        console.log(`[ALLTICKS] Starting AllTick Integration Service - Crypto: ${this.cryptoSymbols.length}, Forex: ${this.forexSymbols.length}`);
+        console.log(`[ALLTICKS] Starting AllTick Integration Service - Crypto: ${this.cryptoSymbols.length}, Forex: ${this.forexSymbols.length}, Commodity: ${this.commoditySymbols.length}`);
         // Always run HTTP polling (5s) as primary source.
         // WS is attempted in parallel — if it delivers ticks they override HTTP data.
         // This handles plans where WS connects but sends no ticks.
@@ -273,7 +298,7 @@ class AllTickService {
     _subscribe() {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-        const symbolList = [...this.forexSymbols, ...this.cryptoSymbols]
+        const symbolList = [...this.forexSymbols, ...this.cryptoSymbols, ...this.commoditySymbols]
             .map(sym => ({ code: sym, depth_level: 5 })); // AllTick uses depth_level for depth subscriptions
 
         const subMsg = {
@@ -316,7 +341,8 @@ class AllTickService {
         const symbol = tick.code; // AllTick uses "code" not "symbol"
         const isForex = this.forexSymbols.includes(symbol);
         const isCrypto = this.cryptoSymbols.includes(symbol);
-        if (!isForex && !isCrypto) return;
+        const isCommodity = this.commoditySymbols.includes(symbol);
+        if (!isForex && !isCrypto && !isCommodity) return;
 
         const cached = this.cache[symbol];
 
@@ -388,15 +414,21 @@ class AllTickService {
             change: 0
         };
 
-        let formatted;
         if (isForex) {
-            formatted = formatForexData(symbol, dataToFormat);
-        } else {
-            formatted = formatCryptoData(symbol, dataToFormat);
+            const formatted = formatForexData(symbol, dataToFormat);
+            this.cache[symbol] = formatted;
+            this._broadcast(formatted);
         }
-
-        this.cache[symbol] = formatted;
-        this._broadcast(formatted);
+        if (isCrypto) {
+            const formatted = formatCryptoData(symbol, dataToFormat);
+            this.cache[symbol] = formatted;
+            this._broadcast(formatted);
+        }
+        if (isCommodity) {
+            const formatted = formatCommodityData(symbol, dataToFormat);
+            this.cache[symbol] = formatted;
+            this._broadcast(formatted);
+        }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -469,7 +501,7 @@ class AllTickService {
     async _poll() {
         if (!this.token || !this.isRunning) return;
 
-        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
+        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols, ...this.commoditySymbols];
         const query = JSON.stringify({
             trace: 'poll-' + Date.now(),
             data: { symbol_list: allSymbols.map(sym => ({ code: sym })) }
@@ -509,7 +541,7 @@ class AllTickService {
     async _pollTradeTick() {
         if (!this.token || !this.isRunning) return;
 
-        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols];
+        const allSymbols = [...this.forexSymbols, ...this.cryptoSymbols, ...this.commoditySymbols];
         const query = JSON.stringify({
             trace: 'trade-' + Date.now(),
             data: { symbol_list: allSymbols.map(sym => ({ code: sym })) }

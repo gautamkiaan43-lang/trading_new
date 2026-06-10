@@ -9,6 +9,7 @@ const allTicksService = require('./allticks.service');
 // Global state for symbols loaded from DB
 let CRYPTO_SYMBOLS_LIST = [];
 let FOREX_SYMBOLS_LIST = [];
+let COMMODITY_SYMBOLS_LIST = [];
 let SYMBOL_META = {};
 
 /**
@@ -66,6 +67,18 @@ class MarketDataService extends EventEmitter {
             FOREX_SYMBOLS_LIST = forexRows.map(r => r.symbol);
             console.log(`[MarketDataService] Loaded ${FOREX_SYMBOLS_LIST.length} forex symbols from DB`);
 
+            // Load Commodity (ONLY GOLD, SILVER, USOIL and NGAS)
+            const [commodityRows] = await db.execute(`
+                SELECT symbol FROM market_group_items mgi
+                JOIN market_groups mg ON mgi.group_id = mg.id
+                WHERE mg.name = 'COMMODITY'
+            `);
+            const allowedCommodities = ['XAU/USD', 'XAG/USD', 'USOIL', 'NGAS'];
+            COMMODITY_SYMBOLS_LIST = commodityRows
+                .map(r => r.symbol)
+                .filter(sym => allowedCommodities.includes(sym));
+            console.log(`[MarketDataService] Loaded ${COMMODITY_SYMBOLS_LIST.length} commodity symbols from DB`);
+
             // Load All Metadata
             const [metaRows] = await db.execute(`
                 SELECT symbol, name, category FROM market_group_items
@@ -92,10 +105,11 @@ class MarketDataService extends EventEmitter {
         const validSymbols = new Set();
         CRYPTO_SYMBOLS_LIST.forEach(sym => validSymbols.add(`CRYPTO:${sym}`));
         FOREX_SYMBOLS_LIST.forEach(sym => validSymbols.add(`FOREX:${sym}`));
+        COMMODITY_SYMBOLS_LIST.forEach(sym => validSymbols.add(`COMMODITY:${sym}`));
 
         let removedCount = 0;
         Object.keys(this.prices).forEach(key => {
-            if ((key.startsWith('CRYPTO:') || key.startsWith('FOREX:')) && !validSymbols.has(key)) {
+            if ((key.startsWith('CRYPTO:') || key.startsWith('FOREX:') || key.startsWith('COMMODITY:')) && !validSymbols.has(key)) {
                 console.log(`[MarketDataService] Removing orphaned price: ${key}`);
                 delete this.prices[key];
                 removedCount++;
@@ -154,9 +168,9 @@ class MarketDataService extends EventEmitter {
         if (this.isConnecting) return;
         this.isConnecting = true;
         try {
-            // Load crypto/forex symbols from DB first (required for AllTicks data)
+            // Load crypto/forex/commodity symbols from DB first (required for AllTicks data)
             await this._loadSymbolsFromDb();
-            console.log(`[MarketDataService] init() - Crypto: ${CRYPTO_SYMBOLS_LIST.length}, Forex: ${FOREX_SYMBOLS_LIST.length}`);
+            console.log(`[MarketDataService] init() - Crypto: ${CRYPTO_SYMBOLS_LIST.length}, Forex: ${FOREX_SYMBOLS_LIST.length}, Commodity: ${COMMODITY_SYMBOLS_LIST.length}`);
 
             const repo = require('../repositories/KiteRepository');
             const kiteService = require('../utils/kiteService');
@@ -237,11 +251,15 @@ class MarketDataService extends EventEmitter {
                 const errMsg = err?.message || String(err);
                 console.error('⚠️ Zerodha Ticker Error:', errMsg);
 
-                if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
-                    console.error('❌ Zerodha 403 Forbidden - Access token expired');
+                if (errMsg.includes('403') || errMsg.includes('Forbidden') || errMsg.includes('expired') || errMsg.includes('Token')) {
+                    console.error('❌ Zerodha 403 Forbidden - Access token expired. Disabling auto-reconnect and stopping ticker.');
                     errorOccurred = true;
+                    try { currentTicker.autoReconnect(false); } catch (e) { }
                     try { currentTicker.disconnect(); } catch (e) { }
-                    if (this.ticker === currentTicker) this.ticker = null;
+                    if (this.ticker === currentTicker) {
+                        this.ticker = null;
+                        this.currentToken = null;
+                    }
                 }
             });
 
@@ -390,10 +408,11 @@ class MarketDataService extends EventEmitter {
                     return;
                 }
                 const crypto = this.getCryptoPrices();
-                const forex  = this.getForexPrices();
+                const forex = this.getForexPrices();
+                const commodity = this.getCommodityPrices();
 
-                if (crypto.length === 0 && forex.length === 0) {
-                    console.warn('WARN [CryptoForexPush] No crypto or forex data available');
+                if (crypto.length === 0 && forex.length === 0 && commodity.length === 0) {
+                    console.warn('WARN [CryptoForexPush] No crypto, forex or commodity data available');
                     return;
                 }
 
@@ -410,10 +429,19 @@ class MarketDataService extends EventEmitter {
                 if (forex.length > 0) {
                     console.log(`[socket] Sending forex (${forex.length}): ${forex[0].symbol} | Bid: ${forex[0].bid} Ask: ${forex[0].ask} LTP: ${forex[0].ltp}`);
                     try {
-                        io.emit('market_data_update', { type: 'forex',  data: forex  });
+                        io.emit('market_data_update', { type: 'forex', data: forex });
                         console.log(`[socket] Forex broadcast emitted successfully`);
                     } catch (emitErr) {
                         console.error(`[socket] Failed to emit forex data:`, emitErr.message);
+                    }
+                }
+                if (commodity.length > 0) {
+                    console.log(`[socket] Sending commodity (${commodity.length}): ${commodity[0].symbol} | Bid: ${commodity[0].bid} Ask: ${commodity[0].ask} LTP: ${commodity[0].ltp}`);
+                    try {
+                        io.emit('market_data_update', { type: 'commodity', data: commodity });
+                        console.log(`[socket] Commodity broadcast emitted successfully`);
+                    } catch (emitErr) {
+                        console.error(`[socket] Failed to emit commodity data:`, emitErr.message);
                     }
                 }
             } catch (e) {
@@ -456,6 +484,16 @@ class MarketDataService extends EventEmitter {
         // Fallback: scan prices — keep only slashed symbols to avoid unslashed duplicates
         return Object.values(this.prices).filter(p =>
             p?.symbol?.startsWith('FOREX:') && p.symbol.includes('/')
+        );
+    }
+
+    getCommodityPrices() {
+        if (COMMODITY_SYMBOLS_LIST && COMMODITY_SYMBOLS_LIST.length > 0) {
+            return COMMODITY_SYMBOLS_LIST.map(sym => this.prices[`COMMODITY:${sym}`]).filter(Boolean);
+        }
+        // Fallback: scan prices — keep only slashed symbols to avoid unslashed duplicates
+        return Object.values(this.prices).filter(p =>
+            p?.symbol?.startsWith('COMMODITY:') && p.symbol.includes('/')
         );
     }
 

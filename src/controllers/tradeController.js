@@ -3,13 +3,14 @@ const { logAction } = require('./systemController');
 const mockEngine = require('../utils/mockEngine');
 const bcrypt = require('bcryptjs');
 const { invalidateCache } = require('../utils/cacheManager');
-const { getMcxBaseScrip } = require('../utils/symbolHelper');
+const { getMcxBaseScrip, getLotSize } = require('../utils/symbolHelper');
+const { buildTradeLog } = require('../utils/logFormatter');
 const MarginService = require('../services/MarginService');
 
-const syncPaperPosition = async (userId, symbol) => {
+const syncPaperPosition = async (userId, symbol, connection = db) => {
     try {
         console.log(`[syncPaperPosition] Syncing paper position for user ${userId}, symbol ${symbol}`);
-        const [trades] = await db.execute(
+        const [trades] = await connection.execute(
             "SELECT type, qty, entry_price FROM trades WHERE user_id = ? AND symbol = ? AND status = 'OPEN' AND is_pending = 0",
             [userId, symbol]
         );
@@ -41,14 +42,14 @@ const syncPaperPosition = async (userId, symbol) => {
 
         if (netQty === 0) {
             // Delete position if closed
-            await db.execute(
+            await connection.execute(
                 "DELETE FROM paper_positions WHERE user_id = ? AND symbol = ?",
                 [userId, symbol]
             );
             console.log(`[syncPaperPosition] Deleted paper position (netQty = 0)`);
         } else {
             // Insert or update position
-            await db.execute(
+            await connection.execute(
                 `INSERT INTO paper_positions (user_id, symbol, quantity, avg_price)
                  VALUES (?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE quantity = ?, avg_price = ?, updated_at = CURRENT_TIMESTAMP`,
@@ -174,14 +175,34 @@ const placeOrder = async (req, res) => {
         const sym = symbol.toUpperCase();
         const MCX_SYMBOLS = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'COPPER', 'NICKEL', 'ZINC', 'LEAD', 'ALUMINIUM', 'ALUMINI', 'NATURALGAS', 'MENTHAOIL', 'COTTON', 'BULLDEX', 'CRUDEOIL MINI', 'ZINCMINI', 'LEADMINI', 'SILVER MIC', 'MGOLD', 'MCRUDEOIL', 'MSILVER', 'MNATURALGAS', 'MCOPPER', 'MLEAD', 'MZINC', 'MALUMINIUM'];
         let marketType = 'MCX';
-        if (MCX_SYMBOLS.some(s => sym.includes(s))) {
-            marketType = 'MCX';
-        } else if (sym.startsWith('CRYPTO') || ['BTC', 'ETH', 'SOL', 'USDT'].some(c => sym.includes(c))) {
+
+        // 🔑 Check explicit prefix first (COMMODITY:, CRYPTO:, FOREX:, COMEX:, MCX:, NSE:, NFO:)
+        if (sym.startsWith('COMMODITY:')) {
+            marketType = 'COMMODITY';
+        } else if (sym.startsWith('COMEX:')) {
+            marketType = 'COMEX';
+        } else if (sym.startsWith('CRYPTO:')) {
             marketType = 'CRYPTO';
-        } else if (sym.startsWith('FOREX') || sym.includes('/') || ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'].some(f => sym.includes(f))) {
+        } else if (sym.startsWith('FOREX:')) {
             marketType = 'FOREX';
+        } else if (sym.startsWith('MCX:')) {
+            marketType = 'MCX';
+        } else if (sym.startsWith('NSE:') || sym.startsWith('NFO:')) {
+            marketType = sym.startsWith('NFO:') ? 'OPTIONS' : 'EQUITY';
+        } else if (MCX_SYMBOLS.some(s => sym.includes(s))) {
+            marketType = 'MCX';
+        } else if (['BTC', 'ETH', 'SOL'].some(c => sym.startsWith(c)) && sym.endsWith('USDT')) {
+            marketType = 'CRYPTO';
+        } else if (['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'].some(f => sym.includes(f))) {
+            marketType = 'FOREX';
+        } else if (['XAU/USD', 'XAG/USD', 'USOIL', 'NGAS'].some(c => sym.includes(c))) {
+            // AllTick commodity symbols (XAU/USD, XAG/USD etc.)
+            marketType = 'COMMODITY';
         } else if (sym.startsWith('COMEX') || ['GC', 'SI', 'HG', 'CL'].some(c => sym.startsWith(c))) {
             marketType = 'COMEX';
+        } else if (sym.startsWith('FOREX') || sym.includes('/')) {
+            // '/' check comes LAST so COMMODITY: symbols with '/' don't fall here
+            marketType = 'FOREX';
         } else {
             marketType = 'EQUITY';
         }
@@ -197,6 +218,7 @@ const placeOrder = async (req, res) => {
             }
         } catch (_) { /* scrip_data may not have market_type column yet */ }
 
+
         // ─── PARSE QUANTITY AND PRICE EARLY (needed for validations) ──────────────
         const qtyNum = parseInt(qty, 10);
 
@@ -209,16 +231,20 @@ const placeOrder = async (req, res) => {
 
         // Normalize symbol - remove double prefixes from frontend
         let normalizedSymbol = symbol;
-        if (symbol.includes('CRYPTO:CRYPTO:') || symbol.includes('FOREX:FOREX:')) {
-            // Fix double prefix: CRYPTO:CRYPTO:ADA/USD → CRYPTO:ADA/USD
-            normalizedSymbol = symbol.replace('CRYPTO:CRYPTO:', 'CRYPTO:').replace('FOREX:FOREX:', 'FOREX:');
+        if (symbol.includes('CRYPTO:CRYPTO:') || symbol.includes('FOREX:FOREX:') ||
+            symbol.includes('COMMODITY:COMMODITY:') || symbol.includes('COMEX:COMEX:')) {
+            normalizedSymbol = symbol
+                .replace('CRYPTO:CRYPTO:', 'CRYPTO:')
+                .replace('FOREX:FOREX:', 'FOREX:')
+                .replace('COMMODITY:COMMODITY:', 'COMMODITY:')
+                .replace('COMEX:COMEX:', 'COMEX:');
             console.log(`[placeOrder] ✅ Fixed double prefix: "${symbol}" → "${normalizedSymbol}"`);
         }
 
         // Build search patterns - only add prefixes if not already present
         const possibleSymbols = [];
         if (!normalizedSymbol.includes(':')) {
-            // No prefix yet - add all variants
+            // No prefix yet — add all relevant variants
             possibleSymbols.push(
                 normalizedSymbol,
                 `MCX:${normalizedSymbol}`,
@@ -226,18 +252,45 @@ const placeOrder = async (req, res) => {
                 `NFO:${normalizedSymbol}`,
                 `CRYPTO:${normalizedSymbol}`,
                 `CRYPTO:${normalizedSymbol.replace(/USDT$/i, '/USD')}`,
-                `FOREX:${normalizedSymbol}`
+                `FOREX:${normalizedSymbol}`,
+                `COMMODITY:${normalizedSymbol}`
             );
         } else {
-            // Already has prefix - use as-is and try variants
+            // Already has prefix — use as-is and try variants
             possibleSymbols.push(normalizedSymbol);
-            // Also try normalized versions (slashed vs unslashed)
-            if (normalizedSymbol.includes('/')) {
-                possibleSymbols.push(normalizedSymbol.replace('/', '').replace(/USD$/, 'USDT'));
-            } else if (normalizedSymbol.endsWith('USDT')) {
-                const baseSym = normalizedSymbol.substring(0, normalizedSymbol.length - 4);
-                const prefix = normalizedSymbol.substring(0, normalizedSymbol.indexOf(':') + 1);
-                possibleSymbols.push(`${prefix}${baseSym}/USD`);
+
+            const colonIdx = normalizedSymbol.indexOf(':');
+            const prefixPart = normalizedSymbol.substring(0, colonIdx);     // e.g. "COMMODITY"
+            const symPart    = normalizedSymbol.substring(colonIdx + 1);    // e.g. "XAU/USD"
+
+            // COMMODITY: XAU/USD → also try FOREX:XAU/USD, COMMODITY:GOLD, FOREX:GOLD (AllTick codes)
+            if (prefixPart === 'COMMODITY') {
+                // AllTick codes: XAU/USD→GOLD, XAG/USD→Silver, USOIL→USOIL, NGAS→NGAS
+                const COMMODITY_ALLTICK_MAP = { 'XAU/USD': 'GOLD', 'XAG/USD': 'Silver', 'USOIL': 'USOIL', 'NGAS': 'NGAS' };
+                const altCode = COMMODITY_ALLTICK_MAP[symPart] || COMMODITY_ALLTICK_MAP[symPart.toUpperCase()];
+                if (altCode) {
+                    possibleSymbols.push(`COMMODITY:${altCode}`, `FOREX:${altCode}`, `FOREX:${symPart}`);
+                }
+                // Also try without slash
+                if (symPart.includes('/')) {
+                    const noSlash = symPart.replace('/', '');
+                    possibleSymbols.push(`COMMODITY:${noSlash}`, `FOREX:${noSlash}`);
+                }
+            } else if (prefixPart === 'CRYPTO') {
+                // CRYPTO:BTC/USD  →  CRYPTO:BTCUSDT
+                if (symPart.includes('/')) {
+                    possibleSymbols.push(`CRYPTO:${symPart.replace('/', '').replace(/USD$/, 'USDT')}`);
+                } else if (symPart.endsWith('USDT')) {
+                    const base = symPart.slice(0, -4);
+                    possibleSymbols.push(`CRYPTO:${base}/USD`);
+                }
+            } else {
+                // Generic slashed/unslashed variants
+                if (symPart.includes('/')) {
+                    possibleSymbols.push(`${prefixPart}:${symPart.replace('/', '').replace(/USD$/, 'USDT')}`);
+                } else if (symPart.endsWith('USDT')) {
+                    possibleSymbols.push(`${prefixPart}:${symPart.slice(0, -4)}/USD`);
+                }
             }
         }
 
@@ -263,10 +316,12 @@ const placeOrder = async (req, res) => {
         }
 
         // 2. For CRYPTO/FOREX from AllTicks, do NOT use Kite fallback
+        //    COMMODITY is also via AllTick but uses same infrastructure
         const isCryptoOrForex = marketType === 'CRYPTO' || marketType === 'FOREX';
+        const isAllTickSymbol = isCryptoOrForex || marketType === 'COMMODITY';
 
-        // 3. If not in stream AND it's not crypto/forex, try DIRECT QUOTE from Kite API (for NFO/NSE/MCX only)
-        if (!liveMarketPrice && !isCryptoOrForex && kiteService.isAuthenticated()) {
+        // 3. If not in stream AND it's not a AllTick symbol, try DIRECT QUOTE from Kite API (for NFO/NSE/MCX only)
+        if (!liveMarketPrice && !isAllTickSymbol && kiteService.isAuthenticated()) {
             try {
                 console.log(`[placeOrder] 📡 Price not in stream, fetching direct quote for ${symbol}...`);
                 // Try to find the correct exchange prefix if not provided
@@ -297,9 +352,9 @@ const placeOrder = async (req, res) => {
 
         // 4. Reject order if live price is unavailable
         if (!liveMarketPrice) {
-            if (isCryptoOrForex) {
+            if (isAllTickSymbol) {
                 return res.status(400).json({
-                    message: `AllTicks data for ${marketType} not available yet. Please wait a moment and try again.`
+                    message: `Live price for ${marketType} symbol "${symbol}" not available. Please wait a moment for market data to load and try again.`
                 });
             } else {
                 return res.status(400).json({ message: 'Live price not available. Please login to Zerodha and ensure the symbol is available.' });
@@ -1446,49 +1501,138 @@ const placeOrder = async (req, res) => {
         }
         // ───────────────────────────────────────────────────────────────────
 
-        const [result] = await db.execute(
-            `INSERT INTO trades
-                (user_id, symbol, type, order_type, qty, entry_price, exit_price, margin_used, is_pending, market_type, status, trade_ip, created_by, trade_type, margin_type,
-                 qty_input, actual_qty, lot_size_at_entry, trade_mode, turnover, leverage_used, equity_units_mode, entry_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-            [
-                targetUserId,
-                sym,
-                type.toUpperCase(),
-                order_type,
-                (isNseEquity || isNseDerivative) ? actualQty : qtyInput, // Store total units for NSE/NFO, keep lots for MCX
-                executionPrice,
-                exit_price ? parseFloat(exit_price) : null,
-                newMarginRequired.toFixed(2),
-                is_pending ? 1 : 0,
-                marketType,
-                'OPEN',
-                tradeIp,
-                requesterId,
-                tradeType,
-                marginConfig.exposureType,
-                qtyInput,
-                actualQty,
-                lotSizeAtEntry,
-                tradeMode,
-                finalTurnover.toFixed(2),
-                leverageUsed,
-                equityUnitsMode
-            ]
-        );
+        let insertedTradeId = null;
+        let finalQty = (isNseEquity || isNseDerivative) ? actualQty : qtyInput;
+        let wasNetted = false;
+        let nettingRes = null;
 
-        // 8. Check Balance but Don't Deduct
-        // (Ledger remains unchanged - margin calculation only for reference)
-        console.log(`[placeOrder] ℹ️ Margin Calculated (NEW FORMULA - Turnover/Leverage): ${newMarginRequired.toFixed(2)}`);
-        console.log(`[placeOrder] ℹ️ Ledger Balance: ${targetUser.balance} (unchanged)`);
+        const connection = await db.getConnection();
+        try {
+            await connection.beginTransaction();
 
-        console.log('✅ Trade Inserted:', result.insertId);
-        if (!is_pending) {
-            await syncPaperPosition(targetUserId, sym);
+            if (is_pending) {
+                const [result] = await connection.execute(
+                    `INSERT INTO trades
+                        (user_id, symbol, type, order_type, qty, entry_price, exit_price, margin_used, is_pending, market_type, status, trade_ip, created_by, trade_type, margin_type,
+                         qty_input, actual_qty, lot_size_at_entry, trade_mode, turnover, leverage_used, equity_units_mode, entry_time)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+                    [
+                        targetUserId,
+                        sym,
+                        type.toUpperCase(),
+                        order_type,
+                        (isNseEquity || isNseDerivative) ? actualQty : qtyInput,
+                        executionPrice,
+                        exit_price ? parseFloat(exit_price) : null,
+                        newMarginRequired.toFixed(2),
+                        marketType,
+                        tradeIp,
+                        requesterId,
+                        tradeType,
+                        marginConfig.exposureType,
+                        qtyInput,
+                        actualQty,
+                        lotSizeAtEntry,
+                        tradeMode,
+                        finalTurnover.toFixed(2),
+                        leverageUsed,
+                        equityUnitsMode
+                    ]
+                );
+                insertedTradeId = result.insertId;
+            } else {
+                const incomingTrade = {
+                    user_id: targetUserId,
+                    symbol: sym,
+                    type: type.toUpperCase(),
+                    order_type,
+                    qty: (isNseEquity || isNseDerivative) ? actualQty : qtyInput,
+                    entry_price: executionPrice,
+                    margin_used: newMarginRequired.toFixed(2),
+                    is_pending: 0,
+                    market_type: marketType,
+                    trade_ip: tradeIp,
+                    created_by: requesterId,
+                    trade_type: tradeType,
+                    margin_type: marginConfig.exposureType,
+                    qty_input: qtyInput,
+                    actual_qty: actualQty,
+                    lot_size_at_entry: lotSizeAtEntry,
+                    trade_mode: tradeMode,
+                    turnover: finalTurnover.toFixed(2),
+                    leverage_used: leverageUsed,
+                    equity_units_mode: equityUnitsMode
+                };
+
+                nettingRes = await tradeService.executeNetting(
+                    targetUserId,
+                    sym,
+                    marketType,
+                    incomingTrade,
+                    connection
+                );
+
+                wasNetted = nettingRes.netted;
+                const remainingQty = nettingRes.remainingQty;
+
+                if (remainingQty > 0) {
+                    const ratio = remainingQty / incomingTrade.qty;
+                    const [result] = await connection.execute(
+                        `INSERT INTO trades
+                            (user_id, symbol, type, order_type, qty, entry_price, exit_price, margin_used, is_pending, market_type, status, trade_ip, created_by, trade_type, margin_type,
+                             qty_input, actual_qty, lot_size_at_entry, trade_mode, turnover, leverage_used, equity_units_mode, entry_time)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+                        [
+                            targetUserId,
+                            sym,
+                            type.toUpperCase(),
+                            order_type,
+                            remainingQty,
+                            executionPrice,
+                            exit_price ? parseFloat(exit_price) : null,
+                            (newMarginRequired * ratio).toFixed(2),
+                            marketType,
+                            tradeIp,
+                            requesterId,
+                            tradeType,
+                            marginConfig.exposureType,
+                            qtyInput * ratio,
+                            actualQty * ratio,
+                            lotSizeAtEntry,
+                            tradeMode,
+                            (finalTurnover * ratio).toFixed(2),
+                            leverageUsed,
+                            equityUnitsMode
+                        ]
+                    );
+                    insertedTradeId = result.insertId;
+                    finalQty = remainingQty;
+                } else {
+                    finalQty = 0;
+                }
+            }
+
+            if (!is_pending) {
+                await syncPaperPosition(targetUserId, sym, connection);
+            }
+
+            await connection.commit();
+        } catch (txnErr) {
+            await connection.rollback();
+            throw txnErr;
+        } finally {
+            connection.release();
         }
+
+        console.log(`[placeOrder] ℹ️ Margin Calculated (NEW FORMULA): ${newMarginRequired.toFixed(2)}`);
+        console.log(`[placeOrder] ℹ️ Ledger Balance: ${targetUser.balance} (unchanged)`);
+        if (insertedTradeId) {
+            console.log('✅ Trade Inserted:', insertedTradeId);
+        }
+
         res.status(201).json({
-            message: 'Order placed successfully',
-            tradeId: result.insertId,
+            message: wasNetted && finalQty === 0 ? 'Order placed and fully netted' : 'Order placed successfully',
+            tradeId: insertedTradeId,
             executionPrice,
             marginUsed: newMarginRequired.toFixed(2),
             qtyInput,
@@ -1496,7 +1640,9 @@ const placeOrder = async (req, res) => {
             tradeMode,
             turnover: finalTurnover.toFixed(2),
             leverage: leverageUsed,
-            equityUnitsMode
+            equityUnitsMode,
+            wasNetted,
+            remainingQty: finalQty
         });
 
         // Notify user via socket for real-time UI update
@@ -1504,24 +1650,99 @@ const placeOrder = async (req, res) => {
             const { getIo } = require('../config/socket');
             const io = getIo();
             if (io) {
-                io.to(`user:${targetUserId}`).emit('notification', {
-                    message: `New ${type.toUpperCase()} order for ${sym.includes(':') ? sym.split(':')[1] : sym} placed successfully at ₹${executionPrice}`,
-                    type: 'ORDER_PLACED',
-                    tradeId: result.insertId
-                });
-                io.to(`user:${targetUserId}`).emit('trade_update', {
-                    id: result.insertId,
-                    is_pending: is_pending ? 1 : 0,
-                    status: 'OPEN'
-                });
+                if (is_pending) {
+                    io.to(`user:${targetUserId}`).emit('notification', {
+                        message: `New ${type.toUpperCase()} order for ${sym.includes(':') ? sym.split(':')[1] : sym} placed successfully at ₹${executionPrice}`,
+                        type: 'ORDER_PLACED',
+                        tradeId: insertedTradeId
+                    });
+                    io.to(`user:${targetUserId}`).emit('trade_update', {
+                        id: insertedTradeId,
+                        is_pending: 1,
+                        status: 'OPEN'
+                    });
+                } else if (finalQty > 0) {
+                    io.to(`user:${targetUserId}`).emit('notification', {
+                        message: `New ${type.toUpperCase()} order for ${sym.includes(':') ? sym.split(':')[1] : sym} placed successfully at ₹${executionPrice}${wasNetted ? ` (partially netted, remaining: ${finalQty})` : ''}`,
+                        type: 'ORDER_PLACED',
+                        tradeId: insertedTradeId
+                    });
+                    io.to(`user:${targetUserId}`).emit('trade_update', {
+                        id: insertedTradeId,
+                        is_pending: 0,
+                        status: 'OPEN',
+                        qty: finalQty
+                    });
+                }
             }
         } catch (socketErr) {
             console.error('[placeOrder] Socket emit error:', socketErr.message);
         }
 
-        // Log the trade placement with new fields
-        await logAction(requesterId, 'PLACE_ORDER', 'trades',
-            `Placed ${type.toUpperCase()} order for ${sym} (Qty Input: ${qtyInput}, Actual Qty: ${actualQty}, Mode: ${tradeMode}, Price: ${executionPrice}) for user #${targetUserId}`);
+        // Log the trade placement with custom activity messages
+        const basePayload = {
+            username: targetUser.username,
+            userId: targetUserId,
+            side: type,
+            symbol: sym,
+            price: executionPrice,
+            availableFunds: parseFloat(targetUser.balance).toFixed(4),
+            requiredFunds: parseFloat(newMarginRequired).toFixed(2)
+        };
+
+        if (is_pending) {
+            if (order_type === 'STOP LOSS') {
+                const slLog = buildTradeLog('STOPLOSS_SCHEDULED', {
+                    ...basePayload,
+                    lots: qtyInput,
+                    qty: actualQty * lotSizeAtEntry,
+                    condition: type.toUpperCase() === 'BUY' ? '1' : '2',
+                    price: executionPrice
+                });
+                await logAction(requesterId, 'PLACE_ORDER', 'trades', slLog);
+            } else {
+                // Limit order: PENDING_ABOVE or PENDING_BELOW
+                const curPrice = (typeof currentPriceNow !== 'undefined' && currentPriceNow) ? currentPriceNow : executionPrice;
+                const isAbove = executionPrice > curPrice;
+                const pendingType = isAbove ? 'PENDING_ABOVE' : 'PENDING_BELOW';
+                const limitLog = buildTradeLog(pendingType, {
+                    ...basePayload,
+                    lots: qtyInput
+                });
+                await logAction(requesterId, 'PLACE_ORDER', 'trades', limitLog);
+            }
+        } else {
+            // Market Order / Immediate execution
+            if (wasNetted) {
+                const nettedQty = qtyInput - finalQty; // portion of incoming order that was netted
+                const openQty = finalQty; // portion that remains open
+
+                if (nettedQty > 0) {
+                    const exitLog = buildTradeLog('EXIT_EXECUTED', {
+                        ...basePayload,
+                        lots: nettedQty,
+                        requiredFunds: parseFloat(newMarginRequired * (nettedQty / qtyInput)).toFixed(2)
+                    });
+                    await logAction(requesterId, 'PLACE_ORDER', 'trades', exitLog);
+                }
+
+                if (openQty > 0) {
+                    const marketLog = buildTradeLog('MARKET_EXECUTED', {
+                        ...basePayload,
+                        lots: openQty,
+                        requiredFunds: parseFloat(newMarginRequired * (openQty / qtyInput)).toFixed(2)
+                    });
+                    await logAction(requesterId, 'PLACE_ORDER', 'trades', marketLog);
+                }
+            } else {
+                // Normal entry market execution (no netting)
+                const marketLog = buildTradeLog('MARKET_EXECUTED', {
+                    ...basePayload,
+                    lots: qtyInput
+                });
+                await logAction(requesterId, 'PLACE_ORDER', 'trades', marketLog);
+            }
+        }
 
 
     } catch (err) {
@@ -1531,17 +1752,83 @@ const placeOrder = async (req, res) => {
 };
 
 /**
+ * Get Active Positions (grouped by symbol+type for Active Positions page)
+ * Returns aggregated open positions: total_qty, avg_price, lot_size, market_type
+ */
+const getActivePositions = async (req, res) => {
+    try {
+        const { id, role } = req.user;
+
+        // Build hierarchy-aware query for OPEN, non-pending trades
+        let query = `
+            SELECT
+                t.symbol,
+                t.type,
+                t.market_type,
+                SUM(t.actual_qty) AS total_qty,
+                SUM(COALESCE(t.qty_input, t.qty, 0)) AS total_lots,
+                AVG(t.entry_price) AS avg_price,
+                MAX(sd.lot_size) AS lot_size,
+                COUNT(*) AS trade_count
+            FROM trades t
+            LEFT JOIN scrip_data sd ON t.symbol = sd.symbol
+            WHERE t.status = 'OPEN'
+              AND t.is_pending = 0
+        `;
+        const params = [];
+
+        // Hierarchy isolation
+        if (role === 'TRADER') {
+            query += ` AND t.user_id = ?`;
+            params.push(id);
+        } else if (role === 'SUPERADMIN') {
+            // See all trades created by superadmin or for their direct children
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.parent_id = ? OR cs.broker_id = ?
+            ))`;
+            params.push(id, id, id);
+        } else if (role === 'ADMIN') {
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+            ))`;
+            params.push(id, id, id);
+        } else if (role === 'BROKER') {
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.parent_id = ? OR cs.broker_id = ?
+            ))`;
+            params.push(id, id, id);
+        }
+
+        query += ` GROUP BY t.symbol, t.type, t.market_type ORDER BY t.symbol ASC`;
+
+        const [rows] = await db.execute(query, params);
+        res.json(rows);
+    } catch (err) {
+        console.error('[getActivePositions] Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
+/**
  * Get Trades by Status (Active, Closed, Deleted)
  */
 const getTrades = async (req, res) => {
     const { status, user_id } = req.query; // OPEN, CLOSED, DELETED, CANCELLED
     try {
-        let query = 'SELECT t.*, u.username, uc.username as created_by_name FROM trades t JOIN users u ON t.user_id = u.id LEFT JOIN users uc ON t.created_by = uc.id WHERE 1=1';
+        let query = 'SELECT t.*, u.username, u.full_name, sd.lot_size, uc.username as created_by_name FROM trades t JOIN users u ON t.user_id = u.id LEFT JOIN users uc ON t.created_by = uc.id LEFT JOIN scrip_data sd ON t.symbol = sd.symbol WHERE 1=1';
         const params = [];
 
         if (status) {
             query += ' AND t.status = ?';
             params.push(status);
+        } else {
+            query += " AND t.status != 'DELETED'";
         }
 
         if (req.query.is_pending !== undefined) {
@@ -1629,7 +1916,8 @@ const getTrades = async (req, res) => {
         // --- ENHANCEMENT: Dynamic Margin and P/L for OPEN trades ---
         // If we are listing OPEN trades, we should calculate the current "Holding Margin Required"
         // and P/L based on live market prices.
-        if (status === 'OPEN' || !status) {
+        const statusUpper = status ? status.toUpperCase() : null;
+        if (statusUpper === 'OPEN' || !statusUpper) {
             // Group by user to fetch configs once
             const userIds = [...new Set(rows.map(r => r.user_id))];
             if (userIds.length > 0) {
@@ -1648,6 +1936,7 @@ const getTrades = async (req, res) => {
                     const clientConfig = configMap[trade.user_id] || {};
                     const calc = MarginUtils.calculateTotalRequiredHoldingMargin([trade], clientConfig);
                     trade.margin_used = calc;
+                    trade.holding_margin = calc;
 
                     // Calculate P/L dynamically for OPEN trades only if pnl is 0/null
                     if (trade.status === 'OPEN' && (!trade.pnl || parseFloat(trade.pnl) === 0)) {
@@ -1739,19 +2028,30 @@ const getTradeById = async (req, res) => {
 const getGroupTrades = async (req, res) => {
     try {
         const { id, role } = req.user;
-        const { scrip, segment, fromDate, toDate } = req.query;
+        const { scrip, segment, fromDate, toDate, timeWindow = 30, minUsers = 2 } = req.query;
 
         let query = `
             SELECT
+                t.id,
+                t.user_id,
                 t.symbol,
                 t.type,
                 t.market_type,
-                SUM(COALESCE(t.actual_qty, t.qty)) as total_qty,
-                AVG(t.entry_price) as avg_price,
-                COUNT(*) as trade_count
+                t.qty,
+                t.actual_qty,
+                t.qty_input,
+                t.entry_price,
+                t.exit_price,
+                t.entry_time,
+                t.exit_time,
+                t.status,
+                t.is_pending,
+                t.created_by,
+                u.username,
+                u.full_name
             FROM trades t
             JOIN users u ON t.user_id = u.id
-            WHERE t.status = 'OPEN'
+            WHERE 1=1
         `;
         const params = [];
 
@@ -1760,10 +2060,8 @@ const getGroupTrades = async (req, res) => {
             query += ` AND t.user_id = ?`;
             params.push(id);
         } else if (role === 'SUPERADMIN') {
-            // Superadmin sees groups for all users
             console.log('[getGroupTrades] SUPERADMIN viewing all groups');
         } else if (role === 'ADMIN') {
-            // Admin sees their groups OR their descendants' groups
             query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
                 LEFT JOIN client_settings cs ON u.id = cs.user_id
@@ -1771,7 +2069,6 @@ const getGroupTrades = async (req, res) => {
             ))`;
             params.push(id, id, id);
         } else if (role === 'BROKER') {
-            // Broker sees their own created groups OR their clients' groups
             query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
                 LEFT JOIN client_settings cs ON u.id = cs.user_id 
@@ -1779,8 +2076,6 @@ const getGroupTrades = async (req, res) => {
             ))`;
             params.push(id, id, id);
         }
-        // Note: Joining users table is kept if needed for future filters, 
-        // though currently we filter by trade.user_id/created_by directly where possible.
 
         // Filter by scrip (symbol)
         if (scrip) {
@@ -1804,12 +2099,96 @@ const getGroupTrades = async (req, res) => {
             params.push(toDate);
         }
 
-        query += ` GROUP BY t.symbol, t.type, t.market_type ORDER BY t.symbol ASC`;
+        query += ` ORDER BY t.symbol ASC, t.type ASC, t.entry_time ASC`;
 
         const [rows] = await db.execute(query, params);
-        res.json(rows);
-    } catch (err) {
 
+        // Group trades by (symbol, type, market_type)
+        const groupedByScrip = {};
+        for (const trade of rows) {
+            const key = `${trade.symbol}_${trade.type}_${trade.market_type}`;
+            if (!groupedByScrip[key]) {
+                groupedByScrip[key] = [];
+            }
+            groupedByScrip[key].push(trade);
+        }
+
+        const detectedGroups = [];
+        let groupCounter = 1;
+
+        const timeWindowMs = (parseInt(timeWindow) || 30) * 1000;
+        const minUsersCount = parseInt(minUsers) || 2;
+
+        for (const key in groupedByScrip) {
+            const trades = groupedByScrip[key];
+            // Sort trades by entry_time
+            trades.sort((a, b) => new Date(a.entry_time) - new Date(b.entry_time));
+
+            let currentCluster = [];
+            for (const trade of trades) {
+                if (currentCluster.length === 0) {
+                    currentCluster.push(trade);
+                } else {
+                    const lastTradeInCluster = currentCluster[currentCluster.length - 1];
+                    const timeDiff = new Date(trade.entry_time) - new Date(lastTradeInCluster.entry_time);
+                    if (timeDiff <= timeWindowMs) {
+                        currentCluster.push(trade);
+                    } else {
+                        processCluster(currentCluster);
+                        currentCluster = [trade];
+                    }
+                }
+            }
+            if (currentCluster.length > 0) {
+                processCluster(currentCluster);
+            }
+        }
+
+        function processCluster(cluster) {
+            const uniqueUsers = [...new Set(cluster.map(t => t.user_id))];
+            if (uniqueUsers.length >= minUsersCount) {
+                const firstTradeTime = new Date(Math.min(...cluster.map(t => new Date(t.entry_time))));
+                const lastTradeTime = new Date(Math.max(...cluster.map(t => new Date(t.entry_time))));
+                const totalQty = cluster.reduce((sum, t) => sum + parseFloat(t.qty || 0), 0);
+                const totalLots = cluster.reduce((sum, t) => sum + parseFloat(t.qty_input != null ? t.qty_input : (t.qty || 0)), 0);
+                const avgPrice = cluster.reduce((sum, t) => sum + parseFloat(t.entry_price || 0), 0) / cluster.length;
+
+                // Advanced Coordinated Exit Check:
+                // Check if all users entered within entry window AND exited within exit window
+                let highlyCoordinated = false;
+                const exitTimes = cluster.map(t => t.exit_time).filter(t => t != null);
+                if (exitTimes.length === cluster.length) {
+                    const firstExitTime = new Date(Math.min(...exitTimes.map(t => new Date(t))));
+                    const lastExitTime = new Date(Math.max(...exitTimes.map(t => new Date(t))));
+                    const exitTimeDifference = Math.round((lastExitTime - firstExitTime) / 1000);
+                    if (exitTimeDifference <= (parseInt(timeWindow) || 30)) {
+                        highlyCoordinated = true;
+                    }
+                }
+
+                const groupId = `G${String(groupCounter++).padStart(3, '0')}`;
+
+                detectedGroups.push({
+                    groupId,
+                    symbol: cluster[0].symbol,
+                    type: cluster[0].type,
+                    market_type: cluster[0].market_type,
+                    usersCount: uniqueUsers.length,
+                    usersList: cluster.map(t => `${t.user_id} : ${t.username || t.full_name || ''}`).filter((v, i, a) => a.indexOf(v) === i),
+                    totalQty,
+                    totalLots,
+                    firstTradeTime: firstTradeTime.toISOString(),
+                    lastTradeTime: lastTradeTime.toISOString(),
+                    timeDifference: Math.round((lastTradeTime - firstTradeTime) / 1000),
+                    avgPrice: avgPrice.toFixed(2),
+                    highlyCoordinated,
+                    trades: cluster
+                });
+            }
+        }
+
+        res.json(detectedGroups);
+    } catch (err) {
         console.error(err);
         res.status(500).send('Server Error');
     }
@@ -1886,7 +2265,8 @@ const closeTrade = async (req, res) => {
         }
 
         // ─── EXECUTE CLOSURE VIA SERVICE ──────────────────────────────────
-        const result = await tradeService.closeTrade(trade.id, exitPrice, requesterId, pnl);
+        const closeIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+        const result = await tradeService.closeTrade(trade.id, exitPrice, requesterId, pnl, null, closeIp);
         await syncPaperPosition(trade.user_id, trade.symbol);
 
         res.json({
@@ -1950,7 +2330,32 @@ const deleteTrade = async (req, res) => {
             await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [balanceRefund, trade.user_id]);
         }
 
-        await logAction(req.user.id, 'DELETE_TRADE', 'trades', `Deleted trade #${req.params.id}. Refunded margin: ${marginToRefund}, PnL: ${pnlToRefund}`);
+        let traderUsername = '';
+        try {
+            const [uRows] = await db.execute('SELECT username FROM users WHERE id = ?', [trade.user_id]);
+            if (uRows.length > 0) traderUsername = uRows[0].username;
+        } catch (e) { console.warn('Error fetching trader username for delete log:', e.message); }
+
+        let adminName = 'admin';
+        try {
+            const [adminRows] = await db.execute('SELECT username, role FROM users WHERE id = ?', [req.user.id]);
+            if (adminRows.length > 0) {
+                adminName = `${adminRows[0].role} ${adminRows[0].username}`;
+            }
+        } catch (e) { console.warn('Error fetching admin details for delete log:', e.message); }
+
+        const lotSz = getLotSize(trade.symbol, trade.market_type);
+        const lots = trade.qty / lotSz;
+
+        const deleteLog = buildTradeLog('ORDER_DELETED', {
+            username: traderUsername,
+            userId: trade.user_id,
+            side: trade.type,
+            lots,
+            symbol: trade.symbol,
+            adminUser: adminName
+        });
+        await logAction(req.user.id, 'DELETE_TRADE', 'trades', deleteLog);
 
         // Clear cache on trade delete (Option A)
         try {
@@ -2080,7 +2485,32 @@ const updateTrade = async (req, res) => {
         await db.execute(`UPDATE trades SET ${updates.join(', ')} WHERE id = ?`, params);
         await syncPaperPosition(trade.user_id, trade.symbol);
 
-        await logAction(req.user.id, 'UPDATE_TRADE', 'trades', `Updated trade #${req.params.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);
+        let traderUsername = '';
+        try {
+            const [uRows] = await db.execute('SELECT username FROM users WHERE id = ?', [trade.user_id]);
+            if (uRows.length > 0) traderUsername = uRows[0].username;
+        } catch (e) { console.warn('Error fetching trader username for update log:', e.message); }
+
+        let adminName = 'admin';
+        try {
+            const [adminRows] = await db.execute('SELECT username, role FROM users WHERE id = ?', [req.user.id]);
+            if (adminRows.length > 0) {
+                adminName = `${adminRows[0].role} ${adminRows[0].username}`;
+            }
+        } catch (e) { console.warn('Error fetching admin details for update log:', e.message); }
+
+        const lotSz = getLotSize(trade.symbol, trade.market_type);
+        const lots = (qty ? parseInt(qty) : trade.qty) / lotSz;
+
+        const updateLog = buildTradeLog('ORDER_UPDATED', {
+            username: traderUsername,
+            userId: trade.user_id,
+            side: trade.type,
+            lots,
+            symbol: trade.symbol,
+            adminUser: adminName
+        });
+        await logAction(req.user.id, 'UPDATE_TRADE', 'trades', updateLog);
 
         res.json({ message: 'Trade updated successfully' });
 
@@ -2152,7 +2582,32 @@ const restoreTrade = async (req, res) => {
             await db.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [balanceDeduction, trade.user_id]);
         }
 
-        await logAction(req.user.id, 'RESTORE_TRADE', 'trades', `Restored trade #${req.params.id} to OPEN. PnL reversed: ${pnl}`);
+        let traderUsername = '';
+        try {
+            const [uRows] = await db.execute('SELECT username FROM users WHERE id = ?', [trade.user_id]);
+            if (uRows.length > 0) traderUsername = uRows[0].username;
+        } catch (e) { console.warn('Error fetching trader username for restore log:', e.message); }
+
+        let adminName = 'admin';
+        try {
+            const [adminRows] = await db.execute('SELECT username, role FROM users WHERE id = ?', [req.user.id]);
+            if (adminRows.length > 0) {
+                adminName = `${adminRows[0].role} ${adminRows[0].username}`;
+            }
+        } catch (e) { console.warn('Error fetching admin details for restore log:', e.message); }
+
+        const lotSz = getLotSize(trade.symbol, trade.market_type);
+        const lots = trade.qty / lotSz;
+
+        const restoreLog = buildTradeLog('ORDER_RESTORED', {
+            username: traderUsername,
+            userId: trade.user_id,
+            side: trade.type,
+            lots,
+            symbol: trade.symbol,
+            adminUser: adminName
+        });
+        await logAction(req.user.id, 'RESTORE_TRADE', 'trades', restoreLog);
 
         res.json({ message: 'Trade restored to OPEN', pnlReversed: pnl });
 
@@ -2345,4 +2800,29 @@ const setTargetSL = async (req, res) => {
     }
 };
 
-module.exports = { placeOrder, getTrades, getTradeById, getGroupTrades, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL };
+const completePendingOrder = async (req, res) => {
+    try {
+        const tradeId = req.params.id;
+        const [trades] = await db.execute('SELECT * FROM trades WHERE id = ?', [tradeId]);
+        if (trades.length === 0) return res.status(404).json({ message: 'Trade not found' });
+
+        const trade = trades[0];
+        if (trade.is_pending !== 1 || trade.status !== 'OPEN') {
+            return res.status(400).json({ message: 'Only open pending orders can be completed' });
+        }
+
+        const executionPrice = parseFloat(trade.entry_price);
+        const result = await tradeService.executePendingOrderNetting(tradeId, executionPrice);
+
+        res.json({
+            message: 'Order completed successfully',
+            executionPrice,
+            ...result
+        });
+    } catch (err) {
+        console.error('Complete Pending Order Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
+module.exports = { placeOrder, getTrades, getTradeById, getGroupTrades, getActivePositions, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL, completePendingOrder };

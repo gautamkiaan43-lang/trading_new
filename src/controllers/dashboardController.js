@@ -78,6 +78,18 @@ const getClientLiveM2M = async (req, res) => {
         const { id: userId, role } = req.user;
         const filterUserId = req.query.userId || req.query.id;
 
+        let filterUserRole = null;
+        if (filterUserId) {
+            const [userRows] = await db.execute('SELECT role FROM users WHERE id = ?', [filterUserId]);
+            if (userRows.length > 0) {
+                filterUserRole = userRows[0].role;
+            }
+        }
+
+        let isBrokerList = false;
+        let brokers = [];
+        let clientToBrokerMap = {};
+
         // 1. Fetch all relevant trades (Non-Deleted)
         let tradeQuery = `
             SELECT t.*, u.username, u.full_name, u.role as user_role, u.balance, cs.config_json as user_config
@@ -88,12 +100,58 @@ const getClientLiveM2M = async (req, res) => {
         `;
         let tradeParams = [];
 
-        if (filterUserId) {
-            tradeQuery += ' AND t.user_id = ?';
-            tradeParams.push(filterUserId);
-        } else if (role === 'SUPERADMIN') {
-            // See everything
-        } else if (role === 'ADMIN' || role === 'BROKER') {
+        if ((role === 'SUPERADMIN' || role === 'ADMIN') && !filterUserId) {
+            isBrokerList = true;
+            let brokerQuery = "SELECT id, username, full_name, role FROM users WHERE role = 'BROKER'";
+            let brokerParams = [];
+            if (role === 'ADMIN') {
+                brokerQuery = "SELECT id, username, full_name, role FROM users WHERE role = 'BROKER' AND parent_id = ?";
+                brokerParams.push(userId);
+            } else if (role === 'SUPERADMIN') {
+                brokerQuery = "SELECT id, username, full_name, role FROM users WHERE role IN ('BROKER', 'ADMIN')";
+            }
+            const [bRows] = await db.execute(brokerQuery, brokerParams);
+            brokers = bRows;
+
+            const brokerIds = brokers.map(b => b.id);
+
+            if (role === 'ADMIN') {
+                tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ? OR cs.broker_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}) OR t.user_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}))`;
+                tradeParams.push(userId, userId, userId);
+            }
+        } else if (filterUserId) {
+            if (filterUserRole === 'ADMIN') {
+                isBrokerList = true;
+                const [bRows] = await db.execute(
+                    "SELECT id, username, full_name, role FROM users WHERE role = 'BROKER' AND parent_id = ?",
+                    [filterUserId]
+                );
+                brokers = bRows;
+
+                tradeQuery += ` AND (t.user_id IN (
+                    SELECT u.id FROM users u
+                    LEFT JOIN client_settings cs ON cs.user_id = u.id
+                    WHERE u.role = 'TRADER' AND (
+                        u.parent_id IN (SELECT id FROM users WHERE parent_id = ? AND role = 'BROKER')
+                        OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ? AND role = 'BROKER')
+                    )
+                ) OR t.user_id = ? OR t.user_id IN (SELECT id FROM users WHERE parent_id = ? AND role = 'BROKER'))`;
+                tradeParams.push(filterUserId, filterUserId, filterUserId, filterUserId);
+            } else if (filterUserRole === 'BROKER') {
+                tradeQuery += ` AND (t.user_id IN (
+                    SELECT u.id FROM users u
+                    LEFT JOIN client_settings cs ON cs.user_id = u.id
+                    WHERE u.role = 'TRADER' AND (
+                        u.parent_id = ?
+                        OR cs.broker_id = ?
+                    )
+                ) OR t.user_id = ?)`;
+                tradeParams.push(filterUserId, filterUserId, filterUserId);
+            } else {
+                tradeQuery += ' AND t.user_id = ?';
+                tradeParams.push(filterUserId);
+            }
+        } else if (role === 'BROKER') {
             tradeQuery += ' AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ?)';
             tradeParams.push(userId, userId, userId);
         } else {
@@ -164,7 +222,8 @@ const getClientLiveM2M = async (req, res) => {
             'OPTIONS': 'NFO',
             'CRYPTO': 'CRYPTO',
             'FOREX': 'FOREX',
-            'COMEX': 'COMEX'
+            'COMEX': 'COMEX',
+            'COMMODITY': 'FOREX'
         };
 
         const finalizedStats = {
@@ -190,7 +249,105 @@ const getClientLiveM2M = async (req, res) => {
             stats.activeUsers[s] = new Set(); stats.profitLoss[s] = 0; stats.brokerage[s] = 0;
         });
 
+        const brokerStatsMap = {};
+        const clientParents = {};
+        const userParentMap = {};
+        const userRoleMap = {};
+
+        if (isBrokerList) {
+            brokers.forEach(b => {
+                brokerStatsMap[b.id] = {
+                    id: b.id,
+                    username: b.username,
+                    fullName: b.full_name,
+                    role: b.role,
+                    activePL: 0,
+                    activeTrades: 0,
+                    closedPL: 0,
+                    margin: 0,
+                    marginUsed: 0
+                };
+            });
+
+            // Load hierarchy
+            const [allUsers] = await db.execute("SELECT id, role, parent_id FROM users");
+            allUsers.forEach(u => {
+                userParentMap[u.id] = u.parent_id;
+                userRoleMap[u.id] = u.role;
+            });
+
+            const [clientBrokerRows] = await db.execute(`
+                SELECT u.id as client_id, u.parent_id as client_parent_id, cs.broker_id as assigned_broker_id
+                FROM users u
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.role = 'TRADER'
+            `);
+
+            clientBrokerRows.forEach(row => {
+                let brokerId = row.assigned_broker_id || row.client_parent_id;
+                let adminId = null;
+                if (brokerId) {
+                    if (userRoleMap[brokerId] === 'ADMIN') {
+                        adminId = brokerId;
+                        brokerId = null;
+                    } else if (userRoleMap[brokerId] === 'BROKER') {
+                        const parentOfBroker = userParentMap[brokerId];
+                        if (parentOfBroker && userRoleMap[parentOfBroker] === 'ADMIN') {
+                            adminId = parentOfBroker;
+                        }
+                    }
+                }
+                clientParents[row.client_id] = { brokerId, adminId };
+            });
+        }
+
         const clientMap = {};
+
+        // Pre-populate clientMap for Broker / Admin / Superadmin so all clients appear even with 0 trades
+        if (!isBrokerList) {
+            let clientsToFetchQuery = '';
+            let clientsToFetchParams = [];
+
+            if (filterUserId && (filterUserRole === 'BROKER' || filterUserRole === 'ADMIN')) {
+                clientsToFetchQuery = `
+                    SELECT u.id, u.username, u.balance
+                    FROM users u
+                    LEFT JOIN client_settings cs ON cs.user_id = u.id
+                    WHERE u.role = 'TRADER' AND (
+                        u.parent_id = ?
+                        OR cs.broker_id = ?
+                    )
+                `;
+                clientsToFetchParams = [filterUserId, filterUserId];
+            } else if (!filterUserId && role === 'BROKER') {
+                clientsToFetchQuery = `
+                    SELECT u.id, u.username, u.balance
+                    FROM users u
+                    LEFT JOIN client_settings cs ON cs.user_id = u.id
+                    WHERE u.role = 'TRADER' AND (
+                        u.parent_id = ?
+                        OR cs.broker_id = ?
+                    )
+                `;
+                clientsToFetchParams = [userId, userId];
+            }
+
+            if (clientsToFetchQuery) {
+                const [cRows] = await db.execute(clientsToFetchQuery, clientsToFetchParams);
+                cRows.forEach(c => {
+                    clientMap[c.id] = {
+                        id: c.id,
+                        username: c.username,
+                        activePL: 0,
+                        activeTrades: 0,
+                        margin: 0,
+                        marginUsed: 0,
+                        balance: parseFloat(c.balance || 0),
+                        positions: {}
+                    };
+                });
+            }
+        }
 
         trades.forEach(trade => {
             const mType = (trade.market_type || 'MCX').toUpperCase();
@@ -203,6 +360,11 @@ const getClientLiveM2M = async (req, res) => {
                 } else {
                     segment = 'nse';
                 }
+            }
+
+            // Map commodity to forex stats since frontend dashboard doesn't have commodity tab
+            if (segment === 'commodity') {
+                segment = 'forex';
             }
 
             const isBuy = trade.type === 'BUY';
@@ -241,6 +403,46 @@ const getClientLiveM2M = async (req, res) => {
 
 
 
+            if (trade.status === 'CLOSED') {
+                const rawClosedPnl = parseFloat(trade.pnl || 0);
+                const netClosedPnl = (parseFloat(trade.pnl || 0) - parseFloat(trade.brokerage || 0) - parseFloat(trade.swap || 0));
+                stats.profitLoss[segment] += netClosedPnl;
+
+                if (isBrokerList) {
+                    if (trade.user_role === 'ADMIN' || trade.user_role === 'BROKER') {
+                        const uId = trade.user_id;
+                        if (brokerStatsMap[uId]) {
+                            brokerStatsMap[uId].closedPL += rawClosedPnl;
+                        }
+                        if (trade.user_role === 'BROKER') {
+                            const parentId = userParentMap[uId];
+                            if (parentId && brokerStatsMap[parentId]) {
+                                brokerStatsMap[parentId].closedPL += rawClosedPnl;
+                            }
+                        }
+                    } else {
+                        const parents = clientParents[trade.user_id];
+                        if (parents) {
+                            const { brokerId, adminId } = parents;
+                            if (brokerId && brokerStatsMap[brokerId]) {
+                                brokerStatsMap[brokerId].closedPL += rawClosedPnl;
+                            }
+                            if (adminId && brokerStatsMap[adminId]) {
+                                brokerStatsMap[adminId].closedPL += rawClosedPnl;
+                            }
+                        }
+                    }
+                } else if (trade.user_role === 'TRADER') {
+                    if (!clientMap[trade.user_id]) {
+                        clientMap[trade.user_id] = {
+                            id: trade.user_id, username: trade.username,
+                            activePL: 0, activeTrades: 0, closedPL: 0, margin: 0, marginUsed: 0, balance: parseFloat(trade.balance || 0)
+                        };
+                    }
+                    clientMap[trade.user_id].closedPL += rawClosedPnl;
+                }
+            }
+
             if (trade.status === 'OPEN' && !trade.is_pending) {
                 stats.activeUsers[segment].add(trade.user_id);
                 if (isBuy) stats.activeBuy[segment] += 1;
@@ -267,6 +469,33 @@ const getClientLiveM2M = async (req, res) => {
                     if (liveData) break;
                 }
 
+                // 🔍 Fuzzy match fallback: if exact lookup fails, try matching by base symbol prefix in cache
+                if (!liveData) {
+                    const baseSym = cleanSymbol.toUpperCase().replace(/\d+.*/, ''); // E.g., get "GOLD" from "GOLD26JUNFUT" or "GOLD"
+                    if (baseSym) {
+                        const allPrices = marketDataService.prices;
+                        // Try matching with same prefix first (e.g. MCX to MCX)
+                        for (const key of Object.keys(allPrices)) {
+                            const cleanKey = key.includes(':') ? key.split(':')[1] : key;
+                            const keyPrefix = key.includes(':') ? key.split(':')[0] : '';
+                            if (cleanKey.toUpperCase().startsWith(baseSym) && (!prefix || keyPrefix.toUpperCase() === prefix.toUpperCase())) {
+                                liveData = allPrices[key];
+                                break;
+                            }
+                        }
+                        // If still not found, try matching any available prefix (e.g. COMMODITY:GOLD as fallback for MCX)
+                        if (!liveData) {
+                            for (const key of Object.keys(allPrices)) {
+                                const cleanKey = key.includes(':') ? key.split(':')[1] : key;
+                                if (cleanKey.toUpperCase().startsWith(baseSym)) {
+                                    liveData = allPrices[key];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Use BID for BUY trades (exit by selling) and ASK for SELL trades (exit by buying)
                 const exitPrice = isBuy
                     ? (liveData?.bid || liveData?.ltp || entryPrice)
@@ -282,72 +511,112 @@ const getClientLiveM2M = async (req, res) => {
                     ? (exitPrice - entryPrice) * totalUnits
                     : (entryPrice - exitPrice) * totalUnits;
 
-                stats.profitLoss[segment] += unrealizedPnl;
-
-                if (!clientMap[trade.user_id]) {
-                    clientMap[trade.user_id] = {
-                        id: trade.user_id, username: trade.username,
-                        activePL: 0, activeTrades: 0, margin: 0, marginUsed: 0, balance: parseFloat(trade.balance || 0)
-                    };
-                }
-                clientMap[trade.user_id].activePL += unrealizedPnl;
-                clientMap[trade.user_id].activeTrades += 1;
-
-                // --- Dynamic Margin Calculation (matching Mobile App Portfolio) ---
-                const base = getMcxBaseScrip(trade.symbol);
-                const isNSE = (trade.market_type === 'EQUITY' || trade.market_type === 'NSE' || trade.market_type === 'NFO');
-
-                // Default: 1000000 for MCX, 50 for NSE Equity (as divisor)
-                const defaultHolding = isNSE ? 50 : 1000000;
-                let holdingExposure = parseFloat(userConfig?.mcxHoldingMargin || defaultHolding);
-
-                // Try multiple key formats to find per-instrument HOLDING margin
-                if (userConfig?.mcxLotMargins) {
-                    const sortedKeys = Object.keys(userConfig.mcxLotMargins).sort((a, b) => b.length - a.length);
-                    for (const key of sortedKeys) {
-                        const upperKey = key.toUpperCase();
-                        if (trade.symbol.toUpperCase().includes(upperKey) || base.toUpperCase().includes(upperKey)) {
-                            if (userConfig.mcxLotMargins[key]?.HOLDING) {
-                                holdingExposure = parseFloat(userConfig.mcxLotMargins[key].HOLDING);
-                                break;
+                if (isBrokerList) {
+                    if (trade.user_role === 'ADMIN' || trade.user_role === 'BROKER') {
+                        const uId = trade.user_id;
+                        if (brokerStatsMap[uId]) {
+                            brokerStatsMap[uId].activePL += unrealizedPnl;
+                            brokerStatsMap[uId].activeTrades += 1;
+                        }
+                        if (trade.user_role === 'BROKER') {
+                            const parentId = userParentMap[uId];
+                            if (parentId && brokerStatsMap[parentId]) {
+                                brokerStatsMap[parentId].activePL += unrealizedPnl;
+                                brokerStatsMap[parentId].activeTrades += 1;
+                            }
+                        }
+                    } else {
+                        const parents = clientParents[trade.user_id];
+                        if (parents) {
+                            const { brokerId, adminId } = parents;
+                            if (brokerId && brokerStatsMap[brokerId]) {
+                                brokerStatsMap[brokerId].activePL += unrealizedPnl;
+                                brokerStatsMap[brokerId].activeTrades += 1;
+                            }
+                            if (adminId && brokerStatsMap[adminId]) {
+                                brokerStatsMap[adminId].activePL += unrealizedPnl;
+                                brokerStatsMap[adminId].activeTrades += 1;
                             }
                         }
                     }
                 }
 
-                let dynamicMargin = 0;
-                if (isNSE) {
-                    // NSE Formula: (Price * Qty) / Exposure
-                    // Note: for NSE, totalUnits IS the quantity of shares
-                    dynamicMargin = (entryPrice * totalUnits) / (holdingExposure || 50);
-                } else {
-                    // MCX Formula: Exposure * Qty
-                    // For MCX, qty is the number of lots
-                    dynamicMargin = holdingExposure * qty;
-                }
+                // --- Dynamic Margin Calculation (matching Mobile App Portfolio) ---
+                const MarginUtils = require('../utils/MarginUtils');
+                trade.lot_size = lotSize;
+                const dynamicMargin = MarginUtils.calculateTotalRequiredHoldingMargin([trade], userConfig);
 
-                // --- Individual Position Tracking (for detail view) ---
-                if (filterUserId) {
-                    if (!clientMap[trade.user_id].positions) clientMap[trade.user_id].positions = {};
-                    const sym = trade.symbol;
-                    if (!clientMap[trade.user_id].positions[sym]) {
-                        clientMap[trade.user_id].positions[sym] = {
-                            symbol: sym,
-                            buyQty: 0, sellQty: 0, buyTotal: 0, sellTotal: 0,
-                            pnl: 0, margin: 0, cmp: exitPrice,
-                            type: trade.type, avgPrice: 0
+                if (isBrokerList) {
+                    if (trade.user_role === 'ADMIN' || trade.user_role === 'BROKER') {
+                        const uId = trade.user_id;
+                        if (brokerStatsMap[uId]) {
+                            brokerStatsMap[uId].margin += dynamicMargin;
+                            brokerStatsMap[uId].marginUsed += parseFloat(trade.margin_used || 0);
+                        }
+                        if (trade.user_role === 'BROKER') {
+                            const parentId = userParentMap[uId];
+                            if (parentId && brokerStatsMap[parentId]) {
+                                brokerStatsMap[parentId].margin += dynamicMargin;
+                                brokerStatsMap[parentId].marginUsed += parseFloat(trade.margin_used || 0);
+                            }
+                        }
+                    } else {
+                        const parents = clientParents[trade.user_id];
+                        if (parents) {
+                            const { brokerId, adminId } = parents;
+                            if (brokerId && brokerStatsMap[brokerId]) {
+                                brokerStatsMap[brokerId].margin += dynamicMargin;
+                                brokerStatsMap[brokerId].marginUsed += parseFloat(trade.margin_used || 0);
+                            }
+                            if (adminId && brokerStatsMap[adminId]) {
+                                brokerStatsMap[adminId].margin += dynamicMargin;
+                                brokerStatsMap[adminId].marginUsed += parseFloat(trade.margin_used || 0);
+                            }
+                        }
+                    }
+                } else if (trade.user_role === 'TRADER') {
+                    if (!clientMap[trade.user_id]) {
+                        clientMap[trade.user_id] = {
+                            id: trade.user_id, username: trade.username,
+                            activePL: 0, activeTrades: 0, closedPL: 0, margin: 0, marginUsed: 0, balance: parseFloat(trade.balance || 0)
                         };
                     }
-                    const p = clientMap[trade.user_id].positions[sym];
-                    if (isBuy) { p.buyQty += qty; p.buyTotal += entryPrice * qty; }
-                    else { p.sellQty += qty; p.sellTotal += entryPrice * qty; }
-                    p.pnl += unrealizedPnl;
-                    p.margin += dynamicMargin;
-                    p.cmp = exitPrice;
-                }
+                    clientMap[trade.user_id].activePL += unrealizedPnl;
+                    clientMap[trade.user_id].activeTrades += 1;
 
-                clientMap[trade.user_id].margin += dynamicMargin;
-                clientMap[trade.user_id].marginUsed += parseFloat(trade.margin_used || 0);
+                    // --- Individual Position Tracking (for detail view) ---
+                    if (filterUserId) {
+                        if (!clientMap[trade.user_id].positions) clientMap[trade.user_id].positions = {};
+                        const sym = trade.symbol;
+                        if (!clientMap[trade.user_id].positions[sym]) {
+                            clientMap[trade.user_id].positions[sym] = {
+                                symbol: sym,
+                                buyQty: 0, sellQty: 0, buyTotal: 0, sellTotal: 0,
+                                actualBuyQty: 0, actualSellQty: 0,
+                                pnl: 0, margin: 0, marginUsed: 0, cmp: exitPrice,
+                                type: trade.type, avgPrice: 0
+                            };
+                        }
+                        const p = clientMap[trade.user_id].positions[sym];
+                        if (isBuy) { 
+                            p.buyQty += qty; 
+                            p.buyTotal += entryPrice * qty;
+                            p.actualBuyQty += parseFloat(trade.actual_qty || 0);
+                        }
+                        else { 
+                            p.sellQty += qty; 
+                            p.sellTotal += entryPrice * qty;
+                            p.actualSellQty += parseFloat(trade.actual_qty || 0);
+                        }
+                        p.pnl += unrealizedPnl;
+                        p.margin += dynamicMargin;
+                        p.marginUsed += parseFloat(trade.margin_used || 0);
+                        p.cmp = exitPrice;
+                    }
+
+                    clientMap[trade.user_id].margin += dynamicMargin;
+                    clientMap[trade.user_id].marginUsed += parseFloat(trade.margin_used || 0);
+                }
             }
         });
 
@@ -379,12 +648,15 @@ const getClientLiveM2M = async (req, res) => {
                 positions = Object.values(c.positions).map(p => {
                     const netQty = p.buyQty - p.sellQty;
                     const avgPrice = netQty > 0 ? (p.buyTotal / p.buyQty) : (netQty < 0 ? (p.sellTotal / p.sellQty) : 0);
+                    const isCryptoForex = p.symbol.startsWith('CRYPTO:') || p.symbol.startsWith('FOREX:');
+                    const decimals = isCryptoForex ? 4 : 2;
                     return {
                         ...p,
                         netQty,
-                        avgPrice: avgPrice.toFixed(2),
-                        pnl: p.pnl.toFixed(2),
-                        margin: p.margin.toFixed(2)
+                        avgPrice: avgPrice.toFixed(decimals),
+                        pnl: p.pnl.toFixed(decimals),
+                        margin: p.margin.toFixed(2),
+                        marginUsed: p.marginUsed.toFixed(2)
                     };
                 });
             }
@@ -394,6 +666,7 @@ const getClientLiveM2M = async (req, res) => {
                 ledger: c.balance.toFixed(2),
                 m2m: netCapital.toFixed(2),
                 activePL: c.activePL.toFixed(2),
+                closedPL: (c.closedPL || 0).toFixed(2),
                 margin: c.margin.toFixed(2),
                 marginUsed: (c.marginUsed || 0).toFixed(2),
                 marginShortfall: shortfall.toFixed(2),
@@ -401,7 +674,26 @@ const getClientLiveM2M = async (req, res) => {
             };
         });
 
+        if (isBrokerList) {
+            const formattedBrokers = Object.values(brokerStatsMap).map(b => {
+                return {
+                    ...b,
+                    activePL: b.activePL.toFixed(2),
+                    closedPL: b.closedPL.toFixed(2),
+                    margin: b.margin.toFixed(2),
+                    marginUsed: b.marginUsed.toFixed(2)
+                };
+            });
+            return res.json({
+                isBrokerList: true,
+                isBroker: true,
+                clients: formattedBrokers,
+                stats: finalizedStats
+            });
+        }
+
         res.json({
+            isBroker: (filterUserRole === 'BROKER' || filterUserRole === 'ADMIN'),
             clients: formattedClients,
             stats: finalizedStats
         });

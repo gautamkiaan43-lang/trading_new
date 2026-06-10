@@ -306,7 +306,17 @@ exports.searchContracts = async (req, res) => {
             isSelected: false
         }));
 
-        const combined = [...kiteContracts, ...cryptoData, ...forexData];
+        const commodityData = marketDataService.getCommodityPrices().filter(c =>
+            c.symbol.toLowerCase().includes(searchTerm) || (c.name || '').toLowerCase().includes(searchTerm)
+        ).map(c => ({
+            symbol: c.symbol,
+            name: c.name,
+            segment: 'COMMODITY',
+            type: 'COMMODITY',
+            isSelected: false
+        }));
+
+        const combined = [...kiteContracts, ...cryptoData, ...forexData, ...commodityData];
 
         res.json({
             status: 'success',

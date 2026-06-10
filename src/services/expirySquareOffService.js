@@ -100,15 +100,17 @@ const startExpirySquareOffJob = () => {
                         const isCrypto = mType === 'CRYPTO';
                         const isForex = mType === 'FOREX';
                         const isComex = mType === 'COMEX';
+                        const isCommodity = mType === 'COMMODITY';
 
-                        if (!isNSE && !isMCX && !isCrypto && !isForex && !isComex) continue; // Skip other segments for now
+                        if (!isNSE && !isMCX && !isCrypto && !isForex && !isComex && !isCommodity) continue; // Skip other segments for now
 
-                        // Check segment specific trigger
+                        // Check segment specific trigger (commodity squares off with forex time)
                         if (isNSE && !isNseTriggered) continue;
                         if (isMCX && !isMcxTriggered) continue;
                         if (isCrypto && !isCryptoTriggered) continue;
                         if (isForex && !isForexTriggered) continue;
                         if (isComex && !isComexTriggered) continue;
+                        if (isCommodity && !isForexTriggered) continue; 
 
                         let holdingMarginRequired = 0;
 
@@ -135,9 +137,11 @@ const startExpirySquareOffJob = () => {
 
                             holdingMarginRequired = turnover / (holdingDivisor || 1);
                         }
-                        else if (isCrypto || isForex || isComex) {
-                            // ✅ GLOBAL LOGIC (Crypto/Comex/Forex)
-                            const segConfig = userConfig[`${mType.toLowerCase()}Config`] || {};
+                        else if (isCrypto || isForex || isComex || isCommodity) {
+                            // ✅ GLOBAL LOGIC (Crypto/Comex/Forex/Commodity)
+                            const segKey = `${mType.toLowerCase()}Config`;
+                            const fallbackKey = mType === 'COMMODITY' ? 'forexConfig' : null;
+                            const segConfig = userConfig[segKey] || (fallbackKey ? userConfig[fallbackKey] : {}) || {};
                             const holdingExposure = parseFloat(segConfig.holdingMargin || segConfig.intradayMargin || 100);
                             const qty = parseFloat(trade.actual_qty || trade.qty || 0);
                             const entryPrice = parseFloat(trade.entry_price || 0);

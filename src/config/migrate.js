@@ -208,6 +208,7 @@ const runMigrations = async () => {
     await addColumn('trades', 'created_by', "INT DEFAULT NULL AFTER trade_ip");
     await addColumn('trades', 'trade_type', "VARCHAR(50) DEFAULT 'INTRADAY' AFTER created_by");
     await addColumn('trades', 'margin_type', "VARCHAR(50) DEFAULT 'PER_LOT_BASIS' AFTER trade_type");
+    await addColumn('trades', 'close_ip', "VARCHAR(45) DEFAULT NULL");
     await addColumn('scrip_data', 'market_type', "ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX' AFTER margin_req");
     await addColumn('scrip_data', 'expiry_date', "DATE DEFAULT NULL AFTER market_type");
 
