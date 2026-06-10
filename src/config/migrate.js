@@ -761,7 +761,8 @@ const runMigrations = async () => {
         ['NFO INDICES', 'NFO_FUT', 6],
         ['CRYPTO', 'CRYPTO', 7],
         ['FOREX', 'FOREX', 8],
-        ['NSE INDICES', 'NSE_INDICES', 9]
+        ['NSE INDICES', 'NSE_INDICES', 9],
+        ['COMMODITY', 'COMMODITY', 10]
     ];
 
     for (const [name, type, order] of groups) {
@@ -823,6 +824,14 @@ const runMigrations = async () => {
         { symbol: 'NIFTY FIN SERVICE', name: 'NIFTY FIN SERVICE' },
         { symbol: 'NIFTY MID SELECT', name: 'NIFTY MID SELECT' }
     ];
+    const commodity = [
+        { symbol: 'XAU/USD', name: 'Gold Spot', category: 'commodity' },
+        { symbol: 'XAG/USD', name: 'Silver Spot', category: 'commodity' },
+        { symbol: 'USOIL', name: 'WTI Crude Oil', category: 'commodity' },
+        { symbol: 'UKOIL', name: 'Brent Crude Oil', category: 'commodity' },
+        { symbol: 'NGAS', name: 'Natural Gas', category: 'commodity' },
+        { symbol: 'COPPER', name: 'Copper', category: 'commodity' }
+    ];
 
     await seedGroupItems('NIFTY 50', n50, 'NSE');
     await seedGroupItems('BANK NIFTY', bn, 'NSE');
@@ -833,6 +842,7 @@ const runMigrations = async () => {
     await seedGroupItems('CRYPTO', crypto, 'CRYPTO');
     await seedGroupItems('FOREX', forex, 'FOREX');
     await seedGroupItems('NSE INDICES', nseInd, 'NSE');
+    await seedGroupItems('COMMODITY', commodity, 'COMMODITY');
 
     // ─── 16. NEW CLIENT BANK SETTINGS ──────────────────────────────────────────
 
