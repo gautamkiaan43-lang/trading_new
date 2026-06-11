@@ -30,30 +30,6 @@ router.get('/debug/refresh-market-data', async (req, res) => {
     }
 });
 
-// Debug: Check DB stats and lists
-router.get('/debug/db-stats', async (req, res) => {
-    try {
-        const db = require('../config/db');
-        const [groups] = await db.execute('SELECT * FROM market_groups');
-        const [items] = await db.execute(`
-            SELECT mg.name as market_group, mgi.symbol, mgi.name as item_name, mgi.category, mgi.exchange 
-            FROM market_group_items mgi 
-            JOIN market_groups mg ON mgi.group_id = mg.id
-        `);
-        const [scripCounts] = await db.execute('SELECT market_type, COUNT(*) as cnt FROM scrip_data GROUP BY market_type');
-        res.json({
-            status: 'success',
-            groups,
-            items_count: items.length,
-            items,
-            scripCounts
-        });
-    } catch (err) {
-        res.status(500).json({ status: 'error', message: err.message });
-    }
-});
-
-
 // Refresh market data cache (clears duplicates) - with auth
 router.post('/refresh-market-data', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN']), async (req, res) => {
     try {

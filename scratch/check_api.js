@@ -5,7 +5,7 @@ async function check() {
   try {
     const req = {
       user: { id: 1, role: 'SUPERADMIN' },
-      query: { userId: '17' } // Broker ID
+      query: {} // Main list of brokers
     };
 
     const res = {

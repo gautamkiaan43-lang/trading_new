@@ -675,15 +675,17 @@ const getClientLiveM2M = async (req, res) => {
         });
 
         if (isBrokerList) {
-            const formattedBrokers = Object.values(brokerStatsMap).map(b => {
-                return {
-                    ...b,
-                    activePL: b.activePL.toFixed(2),
-                    closedPL: b.closedPL.toFixed(2),
-                    margin: b.margin.toFixed(2),
-                    marginUsed: b.marginUsed.toFixed(2)
-                };
-            });
+            const formattedBrokers = Object.values(brokerStatsMap)
+                .filter(b => b.activeTrades > 0)
+                .map(b => {
+                    return {
+                        ...b,
+                        activePL: b.activePL.toFixed(2),
+                        closedPL: b.closedPL.toFixed(2),
+                        margin: b.margin.toFixed(2),
+                        marginUsed: b.marginUsed.toFixed(2)
+                    };
+                });
             return res.json({
                 isBrokerList: true,
                 isBroker: true,
@@ -692,9 +694,14 @@ const getClientLiveM2M = async (req, res) => {
             });
         }
 
+        let resultClients = formattedClients;
+        if (filterUserRole === 'BROKER' || filterUserRole === 'ADMIN' || (!filterUserId && role === 'BROKER')) {
+            resultClients = formattedClients.filter(c => (c.activeTrades || 0) > 0);
+        }
+
         res.json({
             isBroker: (filterUserRole === 'BROKER' || filterUserRole === 'ADMIN'),
-            clients: formattedClients,
+            clients: resultClients,
             stats: finalizedStats
         });
 
