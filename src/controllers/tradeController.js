@@ -6,6 +6,8 @@ const { invalidateCache } = require('../utils/cacheManager');
 const { getMcxBaseScrip, getLotSize } = require('../utils/symbolHelper');
 const { buildTradeLog } = require('../utils/logFormatter');
 const MarginService = require('../services/MarginService');
+const TradeService = require('../services/TradeService');
+const tradeService = new TradeService();
 
 const syncPaperPosition = async (userId, symbol, connection = db) => {
     try {
