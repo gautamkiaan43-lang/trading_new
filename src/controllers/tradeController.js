@@ -6,6 +6,7 @@ const { invalidateCache } = require('../utils/cacheManager');
 const { getMcxBaseScrip, getLotSize } = require('../utils/symbolHelper');
 const { buildTradeLog } = require('../utils/logFormatter');
 const MarginService = require('../services/MarginService');
+const tradeService = require('../services/TradeService');
 
 const syncPaperPosition = async (userId, symbol, connection = db) => {
     try {
@@ -2193,8 +2194,6 @@ const getGroupTrades = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
-
-const tradeService = require('../services/TradeService');
 
 /**
  * Close/Square-off Trade
