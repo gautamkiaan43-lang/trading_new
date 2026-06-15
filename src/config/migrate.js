@@ -190,7 +190,7 @@ const runMigrations = async () => {
             target_price DECIMAL(18,4) DEFAULT NULL,
             status       ENUM('OPEN','CLOSED','CANCELLED','DELETED') NOT NULL DEFAULT 'OPEN',
             is_pending   TINYINT(1) DEFAULT 0,
-            market_type  ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX',
+            market_type  ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX',
             entry_time   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             exit_time    TIMESTAMP NULL DEFAULT NULL,
             pnl          DECIMAL(18,4) DEFAULT 0,
@@ -202,14 +202,15 @@ const runMigrations = async () => {
     `);
 
     // Add market_type to trades & scrip_data for existing DBs
-    await addColumn('trades', 'market_type', "ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX' AFTER is_pending");
+    await addColumn('trades', 'market_type', "ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX' AFTER is_pending");
+    try { await db.execute("ALTER TABLE trades MODIFY COLUMN market_type ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX'"); } catch (_) { }
     await addColumn('trades', 'brokerage', "DECIMAL(18,4) DEFAULT 0 AFTER pnl");
     await addColumn('trades', 'swap', "DECIMAL(18,4) DEFAULT 0 AFTER brokerage");
     await addColumn('trades', 'created_by', "INT DEFAULT NULL AFTER trade_ip");
     await addColumn('trades', 'trade_type', "VARCHAR(50) DEFAULT 'INTRADAY' AFTER created_by");
     await addColumn('trades', 'margin_type', "VARCHAR(50) DEFAULT 'PER_LOT_BASIS' AFTER trade_type");
     await addColumn('trades', 'close_ip', "VARCHAR(45) DEFAULT NULL");
-    await addColumn('scrip_data', 'market_type', "ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX' AFTER margin_req");
+    await addColumn('scrip_data', 'market_type', "ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX' AFTER margin_req");
     await addColumn('scrip_data', 'expiry_date', "DATE DEFAULT NULL AFTER market_type");
 
     // ─── 8. FINANCIALS ─────────────────────────────────────────────────────────
@@ -330,13 +331,13 @@ const runMigrations = async () => {
             symbol      VARCHAR(50) NOT NULL UNIQUE,
             lot_size    INT NOT NULL DEFAULT 1,
             margin_req  DECIMAL(18,4) NOT NULL DEFAULT 100,
-            market_type ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX',
+            market_type ENUM('MCX','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX',
             status      ENUM('OPEN','CLOSED') DEFAULT 'OPEN'
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
 
-    // Expand market_type enum to include NFO
-    try { await db.execute(`ALTER TABLE scrip_data MODIFY COLUMN market_type ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO') DEFAULT 'MCX'`); } catch (_) { }
+    // Expand market_type enum to include NFO & COMMODITY
+    try { await db.execute(`ALTER TABLE scrip_data MODIFY COLUMN market_type ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX'`); } catch (_) { }
 
     // Seed ALL curated scrips (NIFTY50 + BANKNIFTY + MIDCAP + FINNIFTY + MCX + NFO)
     // Scrips are now managed via market_groups and market_group_items for watchlist purposes.
