@@ -296,6 +296,23 @@ const saveTheme = async (req, res) => res.json({ message: 'Use /panel-settings/:
 const getLogo = async (req, res) => res.json({ logoPath: null });
 const uploadLogo = async (req, res) => res.json({ logoPath: null });
 
+const triggerWeeklyClosing = async (req, res) => {
+    try {
+        const { runWeeklyClosing } = require('../services/WeeklySettlementService');
+        // Admin can optionally pass a targetDate in request body to simulate or trigger for a specific date
+        const targetDate = req.body.targetDate ? new Date(req.body.targetDate) : new Date();
+        
+        const result = await runWeeklyClosing(targetDate);
+        res.json({
+            message: 'Weekly closing settlement executed successfully',
+            ...result
+        });
+    } catch (err) {
+        console.error('Trigger Weekly Closing Error:', err);
+        res.status(500).json({ message: 'Failed to execute weekly closing: ' + err.message });
+    }
+};
+
 module.exports = {
     getMenuPermissions,
     saveMenuPermissions,
@@ -308,4 +325,5 @@ module.exports = {
     uploadLogo,
     getLogo,
     getInitData,
+    triggerWeeklyClosing
 };

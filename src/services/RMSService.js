@@ -64,14 +64,22 @@ class RMSService {
 
             // 3. Calculate Total Floating PnL
             let totalPnL = 0;
+            const commodityLotService = require('./CommodityLotService');
             for (const trade of trades) {
                 const liveData = marketDataService.getPrice(trade.symbol);
                 if (!liveData) continue;
 
                 const currentPrice = trade.type === 'BUY' ? (liveData.bid || liveData.ltp) : (liveData.ask || liveData.ltp);
-                const pnl = trade.type === 'BUY'
-                    ? (currentPrice - trade.entry_price) * trade.qty
-                    : (trade.entry_price - currentPrice) * trade.qty;
+                
+                let pnl = 0;
+                if (commodityLotService.isCommodityScrip(trade.symbol, trade.market_type)) {
+                    const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, trade.entry_price, currentPrice, trade.qty);
+                    pnl = calc.pnlInr;
+                } else {
+                    pnl = trade.type === 'BUY'
+                        ? (currentPrice - trade.entry_price) * trade.qty
+                        : (trade.entry_price - currentPrice) * trade.qty;
+                }
 
                 totalPnL += pnl;
             }

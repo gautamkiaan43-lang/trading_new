@@ -876,10 +876,66 @@ const getWatchlist = async (req, res) => {
     }
 };
 
+/**
+ * Get user weekly balance (opening/closing balance for current week)
+ */
+const getWeeklyBalance = async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+        const boundaries = getWeekBoundaries(getISTDate());
+        const { week_start, week_end } = boundaries;
+
+        // Fetch the record for the current week (ending on current week_end)
+        const [rows] = await db.execute(
+            'SELECT * FROM weekly_balances WHERE user_id = ? AND week_end = ?',
+            [userId, week_end]
+        );
+
+        let weeklyBalance = null;
+        if (rows.length > 0) {
+            weeklyBalance = rows[0];
+        } else {
+            // If the weekly closing has not run for this week yet, get the latest available record
+            const [latestRows] = await db.execute(
+                'SELECT * FROM weekly_balances WHERE user_id = ? ORDER BY week_end DESC LIMIT 1',
+                [userId]
+            );
+            
+            if (latestRows.length > 0) {
+                // If there's a previous record, the opening balance for the current week is that week's closing balance
+                weeklyBalance = {
+                    user_id: parseInt(userId),
+                    week_start,
+                    week_end,
+                    opening_balance: parseFloat(latestRows[0].closing_balance),
+                    closing_balance: 0 // Not closed yet
+                };
+            } else {
+                // Otherwise fall back to the user's current balance
+                const [userRows] = await db.execute('SELECT balance, credit_limit FROM users WHERE id = ?', [userId]);
+                const opening = userRows.length > 0 ? parseFloat(userRows[0].balance || 0) : 0;
+                weeklyBalance = {
+                    user_id: parseInt(userId),
+                    week_start,
+                    week_end,
+                    opening_balance: opening,
+                    closing_balance: opening
+                };
+            }
+        }
+
+        res.json(weeklyBalance);
+    } catch (err) {
+        console.error('Get Weekly Balance Error:', err);
+        res.status(500).json({ message: 'Failed to fetch weekly balance' });
+    }
+};
+
 module.exports = {
     getUsers, getUserProfile, updateStatus, resetPassword, deleteUser, updatePasswords,
     updateUser, updateClientSettings, getBrokerShares, updateBrokerShares,
     getDocuments, updateDocuments, getUserSegments, updateUserSegments, getBrokerClients,
     resetAccount, recalculateBrokerage,
-    saveWatchlist, getWatchlist
+    saveWatchlist, getWatchlist, getWeeklyBalance
 };

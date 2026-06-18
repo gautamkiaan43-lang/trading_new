@@ -13,10 +13,14 @@ const {
     uploadLogo,
     getLogo,
     getInitData,
+    triggerWeeklyClosing
 } = require('../controllers/adminController');
 
 // Init data — all authenticated users call this after login
 router.get('/init', authMiddleware, getInitData);
+
+// Weekly Closing / Settlement - SUPERADMIN and ADMIN only
+router.post('/weekly-settlement', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN']), triggerWeeklyClosing);
 
 // Menu Permissions — SUPERADMIN only
 router.get('/menu-permissions/:userId', authMiddleware, roleMiddleware(['SUPERADMIN']), getMenuPermissions);

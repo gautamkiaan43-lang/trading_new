@@ -7,9 +7,10 @@ const formatForexData = (instrument, data) => {
     // Ensure instrument is in format like "EUR/USD"
     let formattedInstrument = instrument;
     if (instrument && !instrument.includes('/')) {
-        // Special case: Silver -> XAG/USD (commodity code for silver)
         if (instrument.toLowerCase() === 'silver') {
             formattedInstrument = 'XAG/USD';
+        } else if (instrument === 'GOLD') {
+            formattedInstrument = 'XAU/USD';
         }
         // EURUSD -> EUR/USD
         else if (instrument.length === 6) {

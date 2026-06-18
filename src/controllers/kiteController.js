@@ -136,13 +136,31 @@ class KiteController {
                     <p style="color:#ccc">User: <strong>${session.user_name || session.user_id || 'N/A'}</strong></p>
                     <div style="background:#0f1729;border:1px solid #2ecc71;border-radius:8px;padding:15px;margin:20px auto;max-width:500px;text-align:left;">
                         <p style="color:#888;font-size:11px;margin:0 0 5px;">ACCESS TOKEN (copy if needed):</p>
-                        <p style="color:#2ecc71;font-family:monospace;font-size:13px;word-break:break-all;margin:0;user-select:all;">${accessToken}</p>
+                        <textarea id="tokenText" readonly style="width:100%;height:60px;background:#1a1a2e;color:#2ecc71;border:1px solid #333;font-family:monospace;font-size:13px;padding:5px;box-sizing:border-box;resize:none;">${accessToken}</textarea>
+                        <button onclick="copyToken()" style="margin-top:10px;background:#2ecc71;color:#fff;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">Copy Token</button>
+                        <span id="copyMsg" style="color:#2ecc71;font-size:12px;margin-left:10px;display:none;">Copied!</span>
                     </div>
-                    <p style="color:#888;font-size:13px;">Redirecting to dashboard in 3s...</p>
+                    <p style="color:#888;font-size:13px;">Redirecting to dashboard in <span id="timer">20</span>s...</p>
+                    <button onclick="window.location.href='${redirectURL}'" style="background:#34495e;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:bold;">Go to Dashboard Now</button>
                     <script>
-                        setTimeout(() => {
-                            window.location.href = '${redirectURL}';
-                        }, 3000);
+                        function copyToken() {
+                            const copyText = document.getElementById("tokenText");
+                            copyText.select();
+                            copyText.setSelectionRange(0, 99999);
+                            navigator.clipboard.writeText(copyText.value);
+                            const msg = document.getElementById("copyMsg");
+                            msg.style.display = "inline";
+                            setTimeout(() => { msg.style.display = "none"; }, 2000);
+                        }
+                        let timeLeft = 20;
+                        const interval = setInterval(() => {
+                            timeLeft--;
+                            document.getElementById("timer").innerText = timeLeft;
+                            if (timeLeft <= 0) {
+                                clearInterval(interval);
+                                window.location.href = '${redirectURL}';
+                            }
+                        }, 1000);
                     </script>
                 </body></html>
             `);

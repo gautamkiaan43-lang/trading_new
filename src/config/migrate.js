@@ -229,6 +229,20 @@ const runMigrations = async () => {
     `);
 
     await db.execute(`
+        CREATE TABLE IF NOT EXISTS weekly_balances (
+            id               INT AUTO_INCREMENT PRIMARY KEY,
+            user_id          INT NOT NULL,
+            week_start       DATE NOT NULL,
+            week_end         DATE NOT NULL,
+            opening_balance  DECIMAL(18,4) NOT NULL,
+            closing_balance  DECIMAL(18,4) NOT NULL,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_user_week (user_id, week_end),
+            CONSTRAINT fk_weekly_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    await db.execute(`
         CREATE TABLE IF NOT EXISTS payment_requests (
             id              INT AUTO_INCREMENT PRIMARY KEY,
             user_id         INT NOT NULL,

@@ -341,12 +341,19 @@ class TradeService {
                 pnl = parseFloat(providedPnl);
                 console.log(`[TradeService] Using provided P/L: ${pnl}`);
             } else {
-                // 🎯 FIXED: Always use (qty * lotSize) for consistent P/L across all segments
-                const qtyForPnl = trade.qty * lotSize;
-                pnl = trade.type === 'BUY'
-                    ? (finalExitPrice - trade.entry_price) * qtyForPnl
-                    : (trade.entry_price - finalExitPrice) * qtyForPnl;
-                console.log(`[TradeService] Calculated P/L using qty×lotSize (${trade.qty}×${lotSize}): ${pnl}`);
+                const commodityLotService = require('./CommodityLotService');
+                if (commodityLotService.isCommodityScrip(trade.symbol, trade.market_type)) {
+                    const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, trade.entry_price, finalExitPrice, trade.qty);
+                    pnl = calc.pnlInr;
+                    console.log(`[TradeService] Calculated Commodity P/L: ${pnl} INR (USD: ${calc.pnlUsd}, Lot Size: ${calc.lotSize}, USDINR: ${calc.usdInr})`);
+                } else {
+                    // 🎯 FIXED: Always use (qty * lotSize) for consistent P/L across all segments
+                    const qtyForPnl = trade.qty * lotSize;
+                    pnl = trade.type === 'BUY'
+                        ? (finalExitPrice - trade.entry_price) * qtyForPnl
+                        : (trade.entry_price - finalExitPrice) * qtyForPnl;
+                    console.log(`[TradeService] Calculated P/L using qty×lotSize (${trade.qty}×${lotSize}): ${pnl}`);
+                }
             }
 
             // 4. Calculate Brokerage & Swap
@@ -824,12 +831,18 @@ class TradeService {
             );
             const lotSize = calcRes.lotSize;
             
-            const qtyForPnl = closeQty * lotSize;
             let pnl = 0;
-            if (oppositeTrade.type === 'BUY') {
-                pnl = (exitPrice - oppositeTrade.entry_price) * qtyForPnl;
+            const commodityLotService = require('./CommodityLotService');
+            if (commodityLotService.isCommodityScrip(oppositeTrade.symbol, oppositeTrade.market_type)) {
+                const calc = commodityLotService.calculatePnL(oppositeTrade.symbol, oppositeTrade.type, oppositeTrade.entry_price, exitPrice, closeQty);
+                pnl = calc.pnlInr;
             } else {
-                pnl = (oppositeTrade.entry_price - exitPrice) * qtyForPnl;
+                const qtyForPnl = closeQty * lotSize;
+                if (oppositeTrade.type === 'BUY') {
+                    pnl = (exitPrice - oppositeTrade.entry_price) * qtyForPnl;
+                } else {
+                    pnl = (oppositeTrade.entry_price - exitPrice) * qtyForPnl;
+                }
             }
 
             const brokerage = calcRes.brokerage;

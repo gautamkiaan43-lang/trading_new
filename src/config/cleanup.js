@@ -23,6 +23,7 @@ const run = async () => {
         'admin_panel_settings',
         'trades',
         'ledger',
+        'weekly_balances',
         'payment_requests',
         'ip_logins',
         'ip_logs',

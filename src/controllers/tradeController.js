@@ -1783,13 +1783,7 @@ const getActivePositions = async (req, res) => {
             query += ` AND t.user_id = ?`;
             params.push(id);
         } else if (role === 'SUPERADMIN') {
-            // See all trades created by superadmin or for their direct children
-            query += ` AND (t.created_by = ? OR t.user_id IN (
-                SELECT u.id FROM users u
-                LEFT JOIN client_settings cs ON u.id = cs.user_id
-                WHERE u.parent_id = ? OR cs.broker_id = ?
-            ))`;
-            params.push(id, id, id);
+            // Superadmins see all active positions (no restriction filter needed)
         } else if (role === 'ADMIN') {
             query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u
@@ -1809,6 +1803,28 @@ const getActivePositions = async (req, res) => {
         query += ` GROUP BY t.symbol, t.type, t.market_type ORDER BY t.symbol ASC`;
 
         const [rows] = await db.execute(query, params);
+        const commodityLotService = require('../services/CommodityLotService');
+        rows.forEach(pos => {
+            const info = commodityLotService.getLotInfo(pos.symbol);
+            if (info) {
+                pos.lot_size = info.lot_size;
+                pos.usdinr_value = info.usdinr_value;
+                pos.is_commodity = info.category === 'COMMODITY' || info.category === 'FOREX' || info.category === 'CRYPTO';
+                if (pos.is_commodity) {
+                    try {
+                        const marketDataService = require('../services/MarketDataService');
+                        const liveUsdInr = marketDataService.prices['FOREX:USD/INR'] || marketDataService.prices['FOREX:USDINR'];
+                        if (liveUsdInr) {
+                            if (pos.type.toUpperCase() === 'BUY') {
+                                pos.usdinr_value = parseFloat(liveUsdInr.ask || liveUsdInr.ltp || pos.usdinr_value);
+                            } else {
+                                pos.usdinr_value = parseFloat(liveUsdInr.bid || liveUsdInr.ltp || pos.usdinr_value);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+        });
         res.json(rows);
     } catch (err) {
         console.error('[getActivePositions] Error:', err);
@@ -1846,48 +1862,31 @@ const getTrades = async (req, res) => {
         if (user_id) {
             query += ' AND t.user_id = ?';
             params.push(user_id);
+        }
 
-            // Role-based visibility logic: "Jisme jo trade banai usko vahi dikhe"
-            // ENHANCED: Admins/Brokers can also see trades of their direct subordinates
-            if (req.user.role !== 'TRADER') {
-                query += ` AND (t.created_by = ? OR t.user_id IN (
-                    SELECT u.id FROM users u 
-                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
-                    WHERE u.parent_id = ? OR cs.broker_id = ?
-                ))`;
-                params.push(req.user.id, req.user.id, req.user.id);
-            }
+        // Role-based visibility isolation (consistent for both global list and client detail view)
+        if (req.user.role === 'SUPERADMIN') {
+            // Superadmins can see all trades in the system
+        } else if (req.user.role === 'ADMIN') {
+            // Admins see their own created trades OR trades of their descendants (clients and brokers under them)
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u 
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+            ))`;
+            params.push(req.user.id, req.user.id, req.user.id);
+        } else if (req.user.role === 'BROKER') {
+            // Brokers see trades they created OR trades of their clients/sub-brokers
+            query += ` AND (t.created_by = ? OR t.user_id IN (
+                SELECT u.id FROM users u 
+                LEFT JOIN client_settings cs ON u.id = cs.user_id 
+                WHERE u.parent_id = ? OR cs.broker_id = ?
+            ))`;
+            params.push(req.user.id, req.user.id, req.user.id);
         } else {
-            // Role-based visibility logic for global list
-            if (req.user.role === 'SUPERADMIN') {
-                // Superadmins see trades they created OR trades of their direct children/clients
-                query += ` AND (t.created_by = ? OR t.user_id IN (
-                    SELECT u.id FROM users u 
-                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
-                    WHERE u.parent_id = ? OR cs.broker_id = ?
-                ))`;
-                params.push(req.user.id, req.user.id, req.user.id);
-            } else if (req.user.role === 'ADMIN') {
-                // Admins see their own created trades OR trades of their descendants
-                query += ` AND (t.created_by = ? OR t.user_id IN (
-                    SELECT u.id FROM users u 
-                    LEFT JOIN client_settings cs ON u.id = cs.user_id
-                    WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
-                ))`;
-                params.push(req.user.id, req.user.id, req.user.id);
-            } else if (req.user.role === 'BROKER') {
-                // Brokers see trades they created OR trades of their clients/sub-brokers
-                query += ` AND (t.created_by = ? OR t.user_id IN (
-                    SELECT u.id FROM users u 
-                    LEFT JOIN client_settings cs ON u.id = cs.user_id 
-                    WHERE u.parent_id = ? OR cs.broker_id = ?
-                ))`;
-                params.push(req.user.id, req.user.id, req.user.id);
-            } else {
-                // TRADER see only their own (already handled in initial if, but safety fallback)
-                query += ' AND t.user_id = ?';
-                params.push(req.user.id);
-            }
+            // TRADER sees only their own trades
+            query += ' AND t.user_id = ?';
+            params.push(req.user.id);
         }
 
         // Filter by username
@@ -1902,6 +1901,14 @@ const getTrades = async (req, res) => {
             params.push(`%${req.query.scrip}%`);
         }
 
+        // Filter by current week only
+        if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
+            const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+            const boundaries = getWeekBoundaries(getISTDate());
+            query += ' AND t.entry_time >= ?';
+            params.push(boundaries.week_start + ' 00:00:00');
+        }
+
         // Filter by date range
         if (req.query.fromDate) {
             query += ' AND DATE(t.entry_time) >= ?';
@@ -1913,6 +1920,28 @@ const getTrades = async (req, res) => {
         }
 
         const [rows] = await db.execute(query, params);
+        const commodityLotService = require('../services/CommodityLotService');
+        rows.forEach(trade => {
+            const info = commodityLotService.getLotInfo(trade.symbol);
+            if (info) {
+                trade.lot_size = info.lot_size;
+                trade.usdinr_value = info.usdinr_value;
+                trade.is_commodity = info.category === 'COMMODITY' || info.category === 'FOREX' || info.category === 'CRYPTO';
+                if (trade.is_commodity && trade.status === 'OPEN') {
+                    try {
+                        const marketDataService = require('../services/MarketDataService');
+                        const liveUsdInr = marketDataService.prices['FOREX:USD/INR'] || marketDataService.prices['FOREX:USDINR'];
+                        if (liveUsdInr) {
+                            if (trade.type.toUpperCase() === 'BUY') {
+                                trade.usdinr_value = parseFloat(liveUsdInr.ask || liveUsdInr.ltp || trade.usdinr_value);
+                            } else {
+                                trade.usdinr_value = parseFloat(liveUsdInr.bid || liveUsdInr.ltp || trade.usdinr_value);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+        });
 
         // --- ENHANCEMENT: Dynamic Margin and P/L for OPEN trades ---
         // If we are listing OPEN trades, we should calculate the current "Holding Margin Required"
@@ -1955,14 +1984,21 @@ const getTrades = async (req, res) => {
                         }
 
                         if (currentPrice) {
-                            const lotSize = parseFloat(trade.lot_size_at_entry || 1);
-                            const qtyForPnl = trade.qty * lotSize;
-                            const entryPrice = parseFloat(trade.entry_price);
-
-                            if (trade.type === 'BUY') {
-                                trade.pnl = (currentPrice - entryPrice) * qtyForPnl;
+                            const commodityLotService = require('../services/CommodityLotService');
+                            if (commodityLotService.isCommodityScrip(trade.symbol, trade.market_type)) {
+                                const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, trade.entry_price, currentPrice, trade.qty);
+                                trade.pnl = calc.pnlInr;
+                                trade.usdinr_value = calc.usdInr;
                             } else {
-                                trade.pnl = (entryPrice - currentPrice) * qtyForPnl;
+                                const lotSize = parseFloat(trade.lot_size_at_entry || 1);
+                                const qtyForPnl = trade.qty * lotSize;
+                                const entryPrice = parseFloat(trade.entry_price);
+
+                                if (trade.type === 'BUY') {
+                                    trade.pnl = (currentPrice - entryPrice) * qtyForPnl;
+                                } else {
+                                    trade.pnl = (entryPrice - currentPrice) * qtyForPnl;
+                                }
                             }
                         }
                     }
@@ -2473,7 +2509,14 @@ const updateTrade = async (req, res) => {
             const entryP = entry_price ? parseFloat(entry_price) : parseFloat(trade.entry_price);
             const exitP = parseFloat(exit_price);
             const q = qty ? parseInt(qty) : trade.qty;
-            const pnl = trade.type === 'BUY' ? (exitP - entryP) * q : (entryP - exitP) * q;
+            let pnl = 0;
+            const commodityLotService = require('../services/CommodityLotService');
+            if (commodityLotService.isCommodityScrip(trade.symbol, trade.market_type)) {
+                const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, entryP, exitP, q);
+                pnl = calc.pnlInr;
+            } else {
+                pnl = trade.type === 'BUY' ? (exitP - entryP) * q : (entryP - exitP) * q;
+            }
             updates.push('pnl = ?');
             params.push(pnl);
         }

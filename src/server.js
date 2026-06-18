@@ -163,6 +163,8 @@ runMigrations()
         // Run background initializations without blocking server startup
         initializeCache().catch(e => console.error('[Cache] Init failed:', e.message));
         syncKiteInstrumentsOnStartup().catch(e => console.error('[Sync] Init failed:', e.message));
+        const commodityLotService = require('./services/CommodityLotService');
+        commodityLotService.load().catch(e => console.error('[CommodityLot] Init failed:', e.message));
 
         // Initialize Paper Trading Engine after DB is ready (if applicable)
         paperTradingEngine.start();
@@ -181,6 +183,10 @@ runMigrations()
         startTargetSLMonitoring(); // Monitor target/SL every 5 seconds
         startAlertMonitoring(); // Monitor price alerts every 3 seconds
         startPendingOrderMonitoring(); // ✅ Monitor pending orders every 3 seconds
+        
+        // Start weekly closing/settlement auto-cron job
+        const { startWeeklySettlementJob } = require('./services/WeeklySettlementService');
+        startWeeklySettlementJob();
 
         // Initialize Market Data (Real Data Only - No Mock Fallback)
         try {

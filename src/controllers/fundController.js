@@ -97,15 +97,16 @@ const createFund = async (req, res) => {
 
 const getFunds = async (req, res) => {
     try {
-        const { userId, amount, fromDate, toDate } = req.query;
+        const { userId, amount, fromDate, toDate, current_week_only } = req.query;
         const role = req.user.role;
         const loggedInId = req.user.id;
 
         // Generate cache key based on filters
-        const cacheKey = `funds_${loggedInId}_${role}_${userId || 'all'}_${amount || 'all'}_${fromDate || 'all'}_${toDate || 'all'}`;
+        const cacheKey = `funds_${loggedInId}_${role}_${userId || 'all'}_${amount || 'all'}_${fromDate || 'all'}_${toDate || 'all'}_${current_week_only || 'false'}`;
 
         // Try cache first
         try {
+            const { getFromCache } = require('../utils/cacheManager');
             const cachedData = await getFromCache(cacheKey);
             if (cachedData) {
                 return res.json(cachedData);
@@ -153,6 +154,12 @@ const getFunds = async (req, res) => {
             query += " AND DATE(l.created_at) <= DATE(?)";
             params.push(toDate);
         }
+        if (current_week_only === 'true' || current_week_only === '1') {
+            const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+            const boundaries = getWeekBoundaries(getISTDate());
+            query += " AND l.created_at >= ?";
+            params.push(boundaries.week_start + ' 00:00:00');
+        }
 
         query += " ORDER BY l.created_at DESC";
 
@@ -160,6 +167,7 @@ const getFunds = async (req, res) => {
 
         // Save to cache with 2 min TTL
         try {
+            const { saveToCache } = require('../utils/cacheManager');
             await saveToCache(cacheKey, rows, 120);
         } catch (e) {
             // Cache save failed, but data still sent

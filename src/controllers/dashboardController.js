@@ -507,9 +507,16 @@ const getClientLiveM2M = async (req, res) => {
                     console.log(`📊 [Realtime P/L] ${trade.symbol} | mType: ${mType} | Exit: ${exitPrice} (${source})`);
                 }
 
-                const unrealizedPnl = isBuy
-                    ? (exitPrice - entryPrice) * totalUnits
-                    : (entryPrice - exitPrice) * totalUnits;
+                let unrealizedPnl = 0;
+                const commodityLotService = require('../services/CommodityLotService');
+                if (commodityLotService.isCommodityScrip(trade.symbol, mType)) {
+                    const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, entryPrice, exitPrice, qty);
+                    unrealizedPnl = calc.pnlInr;
+                } else {
+                    unrealizedPnl = isBuy
+                        ? (exitPrice - entryPrice) * totalUnits
+                        : (entryPrice - exitPrice) * totalUnits;
+                }
 
                 if (isBrokerList) {
                     if (trade.user_role === 'ADMIN' || trade.user_role === 'BROKER') {
@@ -824,7 +831,14 @@ const getWatchlist = async (req, res) => {
         });
 
         const prices = marketDataService.prices;
-        const watchlist = Object.keys(prices).map((symbol, index) => {
+        const filteredKeys = Object.keys(prices).filter(symbol => {
+            if (symbol.startsWith('CRYPTO:') || symbol.startsWith('FOREX:') || symbol.startsWith('COMMODITY:')) {
+                return symbol.includes('/');
+            }
+            return true;
+        });
+
+        const watchlist = filteredKeys.map((symbol, index) => {
             const data = prices[symbol];
             const symOnly = symbol.split(':')[1] || symbol;
             return {
@@ -920,14 +934,21 @@ module.exports = {
                     }
                 } catch (_) { }
 
-                const baseSymbol = Object.keys(INSTRUMENT_META).find(key =>
-                    trade.symbol.toUpperCase().includes(key)
-                );
-                const multiplier = baseSymbol ? INSTRUMENT_META[baseSymbol] : 1;
+                let pnl = 0;
+                const commodityLotService = require('../services/CommodityLotService');
+                if (commodityLotService.isCommodityScrip(trade.symbol, trade.market_type)) {
+                    const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, trade.entry_price, currentPrice, trade.qty);
+                    pnl = calc.pnlInr;
+                } else {
+                    const baseSymbol = Object.keys(INSTRUMENT_META).find(key =>
+                        trade.symbol.toUpperCase().includes(key)
+                    );
+                    const multiplier = baseSymbol ? INSTRUMENT_META[baseSymbol] : 1;
 
-                const pnl = trade.type === 'BUY'
-                    ? (currentPrice - trade.entry_price) * trade.qty * multiplier
-                    : (trade.entry_price - currentPrice) * trade.qty * multiplier;
+                    pnl = trade.type === 'BUY'
+                        ? (currentPrice - trade.entry_price) * trade.qty * multiplier
+                        : (trade.entry_price - currentPrice) * trade.qty * multiplier;
+                }
 
                 if (traderM2M[trade.user_id]) {
                     traderM2M[trade.user_id].live_pnl += pnl;

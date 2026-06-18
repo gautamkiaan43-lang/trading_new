@@ -5,7 +5,7 @@ const {
     getUsers, getUserProfile, updateStatus, deleteUser, updatePasswords, resetPassword,
     updateUser, updateClientSettings, getBrokerShares, updateBrokerShares,
     getDocuments, updateDocuments, getUserSegments, updateUserSegments, getBrokerClients,
-    resetAccount, recalculateBrokerage, saveWatchlist, getWatchlist
+    resetAccount, recalculateBrokerage, saveWatchlist, getWatchlist, getWeeklyBalance
 } = require('../controllers/userController');
 const { authMiddleware, roleMiddleware, brokerPermission, brokerSharesPermission } = require('../middleware/auth');
 
@@ -15,6 +15,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 // ─── EXISTING ROUTES ─────────────────────────────────
 router.get('/', authMiddleware, getUsers);
 router.get('/:id', authMiddleware, getUserProfile);
+router.get('/:id/weekly-balance', authMiddleware, getWeeklyBalance);
 router.put('/:id/status', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN', 'BROKER']), updateStatus);
 router.delete('/:id', authMiddleware, roleMiddleware(['SUPERADMIN', 'ADMIN', 'BROKER']), deleteUser);
 router.put('/:id/passwords', authMiddleware, brokerPermission('createClientsAllowed'), updatePasswords);
